@@ -187,6 +187,31 @@ export default function TripMap({
     const validActivities = activities.filter(a => a.latitude && a.longitude);
     if (validActivities.length < 2) return;
 
+    // The route is fetched asynchronously, so by the time it resolves the effect
+    // may have re-run or the component unmounted — in which case the init effect
+    // has already called map.remove(). Adding a layer to a removed map throws
+    // deep inside Leaflet ("bounds is undefined") because its renderer is gone.
+    let cancelled = false;
+    const controller = new AbortController();
+
+    // Still the live map, still attached to the document.
+    const mapIsUsable = () =>
+      !cancelled &&
+      mapInstanceRef.current === map &&
+      !!map._container &&
+      document.body.contains(map._container);
+
+    const drawStraightLine = () => {
+      if (!mapIsUsable()) return;
+      const latlngs = validActivities.map(a => [a.latitude, a.longitude]);
+      routeRef.current = L.polyline(latlngs, {
+        color: '#E8B87D',
+        weight: 3,
+        opacity: 0.7,
+        dashArray: '10, 10',
+      }).addTo(map);
+    };
+
     const fetchRoute = async () => {
       setRouteLoading(true);
       try {
@@ -194,59 +219,49 @@ export default function TripMap({
         const orsKey = process.env.NEXT_PUBLIC_ORS_API_KEY;
 
         if (orsKey) {
-          // Use OpenRouteService for real routing
           const response = await fetch(
             'https://api.openrouteservice.org/v2/directions/foot-walking/geojson',
             {
               method: 'POST',
-              headers: {
-                'Content-Type': 'application/json',
-                Authorization: orsKey,
-              },
+              headers: { 'Content-Type': 'application/json', Authorization: orsKey },
               body: JSON.stringify({ coordinates: coords }),
+              signal: controller.signal,
             }
           );
 
           if (response.ok) {
             const data = await response.json();
             if (data.features?.[0]) {
+              if (!mapIsUsable()) return;
               routeRef.current = L.geoJSON(data.features[0], {
-                style: {
-                  color: '#E8B87D',
-                  weight: 4,
-                  opacity: 0.8,
-                  dashArray: '8, 8',
-                },
+                style: { color: '#E8B87D', weight: 4, opacity: 0.8, dashArray: '8, 8' },
               }).addTo(map);
-              setRouteLoading(false);
               return;
             }
           }
         }
 
-        // Fallback: draw simple polyline
-        const latlngs = validActivities.map(a => [a.latitude, a.longitude]);
-        routeRef.current = L.polyline(latlngs, {
-          color: '#E8B87D',
-          weight: 3,
-          opacity: 0.7,
-          dashArray: '10, 10',
-        }).addTo(map);
+        drawStraightLine();
       } catch (err) {
-        // Fallback to simple line
-        const latlngs = validActivities.map(a => [a.latitude, a.longitude]);
-        routeRef.current = L.polyline(latlngs, {
-          color: '#E8B87D',
-          weight: 3,
-          opacity: 0.7,
-          dashArray: '10, 10',
-        }).addTo(map);
+        // An aborted request is expected on cleanup, not a failure to fall back from.
+        if (err.name !== 'AbortError') drawStraightLine();
       } finally {
-        setRouteLoading(false);
+        if (!cancelled) setRouteLoading(false);
       }
     };
 
     fetchRoute();
+
+    return () => {
+      cancelled = true;
+      controller.abort();
+      // Drop the layer here too, so a route drawn by a previous run can't be
+      // orphaned on the map when routeRef is reassigned.
+      if (routeRef.current && mapInstanceRef.current === map && map._container) {
+        map.removeLayer(routeRef.current);
+        routeRef.current = null;
+      }
+    };
   }, [activities, showRoute]);
 
   return (

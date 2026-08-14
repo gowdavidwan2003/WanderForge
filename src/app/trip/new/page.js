@@ -5,6 +5,8 @@ import { useRouter } from 'next/navigation';
 import { useAuth } from '@/context/AuthProvider';
 import { useToast } from '@/components/ui/Toast';
 import { getSupabaseBrowserClient } from '@/lib/supabase/client';
+import { withTimeout } from '@/lib/withTimeout';
+import { CURRENCIES, inferCurrency, currencySymbol } from '@/lib/currency';
 import Button from '@/components/ui/Button';
 import Input from '@/components/ui/Input';
 
@@ -48,7 +50,7 @@ export default function NewTripPage() {
     interests: [],
     budgetLevel: 'moderate',
     totalBudget: '',
-    currency: 'USD',
+    currency: 'AUTO',
     travelStyle: '',
     notes: '',
   });
@@ -59,6 +61,9 @@ export default function NewTripPage() {
   const supabase = getSupabaseBrowserClient();
 
   const totalSteps = 4;
+
+  // Shown next to the Auto option so the traveler can see what will be used.
+  const detectedCurrency = inferCurrency(formData.destination);
 
   const updateForm = (key, value) => {
     setFormData((prev) => ({ ...prev, [key]: value }));
@@ -113,7 +118,7 @@ export default function NewTripPage() {
       const dayCount = getDayCount();
 
       // Create the trip
-      const { data: trip, error: tripError } = await supabase
+      const { data: trip, error: tripError } = await withTimeout(supabase
         .from('trips')
         .insert({
           user_id: user.id,
@@ -123,7 +128,10 @@ export default function NewTripPage() {
           end_date: formData.endDate,
           transport_mode: formData.transportMode,
           total_budget: formData.totalBudget ? parseFloat(formData.totalBudget) : null,
-          currency: formData.currency,
+          // 'AUTO' resolves from the destination; the AI confirms it on generate.
+          currency: formData.currency === 'AUTO'
+            ? (inferCurrency(formData.destination) || 'USD')
+            : formData.currency,
           status: 'planned',
           ai_preferences: {
             interests: formData.interests,
@@ -133,7 +141,7 @@ export default function NewTripPage() {
           },
         })
         .select()
-        .single();
+        .single(), 'Creating your trip');
 
       if (tripError) throw tripError;
       console.log('[WanderForge] Trip created:', trip.id);
@@ -149,7 +157,10 @@ export default function NewTripPage() {
         };
       });
 
-      const { error: daysError } = await supabase.from('trip_days').insert(days);
+      const { error: daysError } = await withTimeout(
+        supabase.from('trip_days').insert(days),
+        'Creating trip days'
+      );
       if (daysError) throw daysError;
       console.log('[WanderForge] Created', dayCount, 'days');
 
@@ -158,6 +169,9 @@ export default function NewTripPage() {
     } catch (err) {
       console.error('[WanderForge] Create trip error:', err);
       toast.error(err.message || 'Failed to create trip', 'Error');
+    } finally {
+      // Previously only reset in catch, so any non-throwing stall left the
+      // button spinning with no way to retry.
       setLoading(false);
     }
   };
@@ -308,20 +322,19 @@ export default function NewTripPage() {
                   value={formData.totalBudget}
                   onChange={(e) => updateForm('totalBudget', e.target.value)}
                 />
-                <div style={{ maxWidth: 120 }}>
+                <div style={{ maxWidth: 190 }}>
                   <label className="currency-label">Currency</label>
                   <select
                     className="currency-select"
                     value={formData.currency}
                     onChange={(e) => updateForm('currency', e.target.value)}
                   >
-                    <option value="USD">USD $</option>
-                    <option value="EUR">EUR €</option>
-                    <option value="GBP">GBP £</option>
-                    <option value="INR">INR ₹</option>
-                    <option value="JPY">JPY ¥</option>
-                    <option value="AUD">AUD $</option>
-                    <option value="CAD">CAD $</option>
+                    <option value="AUTO">
+                      Auto{detectedCurrency ? ` — ${detectedCurrency} ${currencySymbol(detectedCurrency)}` : ''}
+                    </option>
+                    {Object.entries(CURRENCIES).map(([code, meta]) => (
+                      <option key={code} value={code}>{code} {meta.symbol}</option>
+                    ))}
                   </select>
                 </div>
               </div>

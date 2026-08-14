@@ -1,40 +1,55 @@
 'use client';
 
-import { useEffect, useState, useCallback } from 'react';
+import { useEffect, useState, useCallback, useRef } from 'react';
 import { getSupabaseBrowserClient } from '@/lib/supabase/client';
 
 /**
  * Hook for real-time trip collaboration
  * Subscribes to changes on trips, trip_days, and activities
  */
-export function useRealtimeTrip(tripId, onUpdate) {
+export function useRealtimeTrip(tripId, onUpdate, dayIds = []) {
   const [presenceState, setPresenceState] = useState({});
   const [channel, setChannel] = useState(null);
   const supabase = getSupabaseBrowserClient();
 
+  // Stable id for this browser tab, so each client gets its own presence key.
+  // Generated inside the effect below — randomness during render is impure.
+  const presenceKeyRef = useRef(null);
+
+  // Join by value so the effect re-subscribes when the trip's days finish loading.
+  const dayIdKey = dayIds.join(',');
+
   useEffect(() => {
     if (!tripId) return;
 
-    // Create a channel for this trip
+    if (!presenceKeyRef.current) {
+      presenceKeyRef.current =
+        globalThis.crypto?.randomUUID?.() ?? Math.random().toString(36).slice(2);
+    }
+
+    const currentDayIds = dayIdKey ? dayIdKey.split(',') : [];
+
     const tripChannel = supabase.channel(`trip:${tripId}`, {
       config: {
-        presence: { key: tripId },
+        // Presence must be keyed per user. Keying by tripId put every client under
+        // the same key, so each join/leave overwrote everyone else's entry.
+        presence: { key: `${tripId}:${presenceKeyRef.current}` },
         broadcast: { self: false },
       },
     });
 
-    // Listen for database changes on activities
+    // Realtime filters only support comparisons against literal values — the old
+    // `in.(select ...)` subquery was never valid, so activity changes never arrived.
+    // Subscribe unfiltered (RLS still limits what we receive) and match locally.
     tripChannel
       .on(
         'postgres_changes',
-        {
-          event: '*',
-          schema: 'public',
-          table: 'activities',
-          filter: `trip_day_id=in.(select id from trip_days where trip_id='${tripId}')`,
-        },
+        { event: '*', schema: 'public', table: 'activities' },
         (payload) => {
-          onUpdate?.('activities', payload.eventType, payload.new || payload.old);
+          const row = payload.new || payload.old;
+          if (!row) return;
+          if (currentDayIds.length && !currentDayIds.includes(row.trip_day_id)) return;
+          onUpdate?.('activities', payload.eventType, row);
         }
       )
       .on(
@@ -100,7 +115,7 @@ export function useRealtimeTrip(tripId, onUpdate) {
     return () => {
       supabase.removeChannel(tripChannel);
     };
-  }, [tripId]);
+  }, [tripId, dayIdKey]);
 
   const broadcastCursor = useCallback(
     (data) => {

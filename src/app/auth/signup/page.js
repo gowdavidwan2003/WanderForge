@@ -41,6 +41,11 @@ export default function SignupPage() {
     setLoading(false);
 
     if (error) {
+      if (error.code === 'user_already_exists') {
+        setErrors({ email: 'This email is already registered' });
+        toast.info('That email already has an account — log in instead.', 'Already Registered');
+        return;
+      }
       toast.error(error.message, 'Signup Failed');
     } else {
       toast.success('Check your email for the verification code!', 'Almost There!');

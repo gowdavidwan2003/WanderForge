@@ -1,7 +1,9 @@
 'use client';
 
-import { useState, useEffect } from 'react';
+import { useState, useEffect, useCallback } from 'react';
 import Link from 'next/link';
+import { useRouter } from 'next/navigation';
+import { withTimeout } from '@/lib/withTimeout';
 import { useAuth } from '@/context/AuthProvider';
 import { getSupabaseBrowserClient } from '@/lib/supabase/client';
 import Button from '@/components/ui/Button';
@@ -9,26 +11,139 @@ import LoadingSpinner from '@/components/ui/LoadingSpinner';
 import Footer from '@/components/layout/Footer';
 
 export default function DashboardPage() {
-  const { user, profile } = useAuth();
+  const { user, profile, loading: authLoading } = useAuth();
   const [trips, setTrips] = useState([]);
+  const [invitations, setInvitations] = useState([]);
+  const [respondingTo, setRespondingTo] = useState(null);
   const [loading, setLoading] = useState(true);
+  const [error, setError] = useState(null);
+  const router = useRouter();
   const supabase = getSupabaseBrowserClient();
 
   const displayName = user?.user_metadata?.display_name || user?.email?.split('@')[0] || 'Explorer';
 
-  useEffect(() => {
-    const fetchTrips = async () => {
-      if (!user) return;
-      const { data } = await supabase
-        .from('trips')
-        .select('*')
-        .eq('user_id', user.id)
-        .order('created_at', { ascending: false });
-      setTrips(data || []);
+  const fetchTrips = useCallback(async () => {
+    // Wait for auth to resolve before deciding anything. Previously this returned
+    // early whenever `user` was falsy without clearing `loading`, so an unresolved
+    // or expired session left "Loading your trips..." on screen indefinitely.
+    if (authLoading) return;
+
+    if (!user) {
       setLoading(false);
+      router.replace('/auth/login?redirect=%2Fdashboard');
+      return;
+    }
+
+    setError(null);
+
+    // Each call is timed and settled independently. Bundling them in a single
+    // Promise.all made the dashboard all-or-nothing: one slow call blanked
+    // everything, including trips that had already come back fine.
+    const attempt = async (label, run) => {
+      try {
+        const { data, error: qErr } = await withTimeout(run(), label, 20000);
+        if (qErr) throw qErr;
+        return { data };
+      } catch (err) {
+        // A stalled query almost always means it was queued behind a token
+        // refresh that hadn't settled. Force the refresh, then retry once —
+        // that turns a visible failure into an invisible hiccup.
+        console.warn(`[WanderForge] ${label} stalled, refreshing session and retrying...`);
+        try {
+          await withTimeout(supabase.auth.refreshSession(), 'Refreshing session', 10000);
+          const { data, error: qErr } = await withTimeout(run(), label, 20000);
+          if (qErr) throw qErr;
+          return { data };
+        } catch (retryErr) {
+          console.error(`[WanderForge] ${label} failed after retry:`, retryErr);
+          return { failed: retryErr.message || String(retryErr) };
+        }
+      }
     };
+
+    // Trips the user owns, plus trips shared via an accepted invitation. This
+    // previously filtered on user_id alone, so collaborators never saw a shared
+    // trip on their dashboard at all.
+    const [owned, sharedIds, invites] = await Promise.all([
+      attempt('Loading your trips', () =>
+        supabase.from('trips').select('*').eq('user_id', user.id)),
+      attempt('Loading shared trips', () => supabase.rpc('get_shared_trip_ids')),
+      attempt('Loading invitations', () => supabase.rpc('get_my_invitations')),
+    ]);
+
+    let shared = [];
+    const ids = (sharedIds.data || []).map(r =>
+      typeof r === 'string' ? r : r.get_shared_trip_ids
+    );
+    if (ids.length) {
+      const res = await attempt('Loading shared trip details', () =>
+        supabase.from('trips').select('*').in('id', ids));
+      shared = (res.data || []).map(t => ({ ...t, shared: true }));
+    }
+
+    setTrips(
+      [...(owned.data || []), ...shared].sort(
+        (a, b) => new Date(b.created_at) - new Date(a.created_at)
+      )
+    );
+    setInvitations(invites.data || []);
+
+    // Only the owned-trips query is essential. If the collaboration extras fail
+    // we still render the dashboard rather than replacing it with an error.
+    if (owned.failed) {
+      setError(owned.failed);
+    } else if (sharedIds.failed || invites.failed) {
+      setError(null);
+      console.warn('[WanderForge] Collaboration data unavailable; showing owned trips only.');
+    }
+
+    setLoading(false);
+    // Keyed on the user id, not the user object — Supabase hands back a new object
+    // on every token refresh, which would otherwise refire this on each cycle.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [user?.id, authLoading, router]);
+
+  const resetSession = async () => {
+    try {
+      await supabase.auth.signOut({ scope: 'local' });
+    } catch {
+      /* clearing local state below is what matters */
+    }
+    try {
+      Object.keys(window.localStorage)
+        .filter(k => k.startsWith('sb-'))
+        .forEach(k => window.localStorage.removeItem(k));
+    } catch { /* storage may be unavailable */ }
+    router.replace('/auth/login?redirect=%2Fdashboard');
+  };
+
+  useEffect(() => {
     fetchTrips();
-  }, [user]);
+  }, [fetchTrips]);
+
+  const respondToInvite = async (invite, accept) => {
+    setRespondingTo(invite.id);
+    try {
+      if (accept) {
+        const { error } = await supabase
+          .from('trip_collaborators')
+          .update({ accepted: true })
+          .eq('id', invite.id);
+        if (error) throw error;
+      } else {
+        const { error } = await supabase
+          .from('trip_collaborators')
+          .delete()
+          .eq('id', invite.id);
+        if (error) throw error;
+      }
+      await fetchTrips();
+    } catch (err) {
+      console.error('[WanderForge] Invitation response failed:', err);
+    } finally {
+      setRespondingTo(null);
+    }
+  };
 
   const getStatusColor = (status) => {
     const colors = {
@@ -118,6 +233,53 @@ export default function DashboardPage() {
           </div>
         </section>
 
+        {/* Pending Invitations */}
+        {invitations.length > 0 && (
+          <section className="dashboard__invites">
+            <div className="container">
+              <h2 className="section-heading">
+                Trip Invitations <span className="invite-count">{invitations.length}</span>
+              </h2>
+              <div className="invites-list">
+                {invitations.map((inv) => (
+                  <div key={inv.id} className="invite-card animate-fade-in-up">
+                    <div className="invite-card__icon">✉️</div>
+                    <div className="invite-card__body">
+                      <h3 className="invite-card__title">{inv.trip_title || 'Untitled Trip'}</h3>
+                      <p className="invite-card__meta">
+                        📍 {inv.trip_destination || 'No destination'}
+                        {inv.trip_start_date && ` · ${new Date(inv.trip_start_date).toLocaleDateString('en-US', { month: 'short', day: 'numeric' })}`}
+                      </p>
+                      <p className="invite-card__from">
+                        <strong>{inv.owner_name || inv.owner_email}</strong> invited you as <strong>{inv.role}</strong>
+                      </p>
+                    </div>
+                    <div className="invite-card__actions">
+                      <Button
+                        variant="primary"
+                        size="sm"
+                        onClick={() => respondToInvite(inv, true)}
+                        loading={respondingTo === inv.id}
+                        disabled={respondingTo === inv.id}
+                      >
+                        Accept
+                      </Button>
+                      <Button
+                        variant="ghost"
+                        size="sm"
+                        onClick={() => respondToInvite(inv, false)}
+                        disabled={respondingTo === inv.id}
+                      >
+                        Decline
+                      </Button>
+                    </div>
+                  </div>
+                ))}
+              </div>
+            </div>
+          </section>
+        )}
+
         {/* Trips Section */}
         <section className="dashboard__trips">
           <div className="container">
@@ -132,6 +294,22 @@ export default function DashboardPage() {
               <div className="dashboard__loading">
                 <LoadingSpinner size={48} />
                 <p>Loading your trips...</p>
+              </div>
+            ) : error ? (
+              <div className="dashboard__empty animate-fade-in-up">
+                <div className="empty-state">
+                  <span className="empty-state__icon">⚠️</span>
+                  <h3 className="empty-state__title">Couldn&apos;t load your trips</h3>
+                  <p className="empty-state__desc">{error}</p>
+                  <div style={{ display: 'flex', gap: 'var(--space-3)', justifyContent: 'center' }}>
+                    <Button variant="primary" onClick={() => { setLoading(true); fetchTrips(); }}>
+                      Try Again
+                    </Button>
+                    <Button variant="ghost" onClick={resetSession}>
+                      Reset Session
+                    </Button>
+                  </div>
+                </div>
               </div>
             ) : trips.length === 0 ? (
               <div className="dashboard__empty animate-fade-in-up">
@@ -174,7 +352,10 @@ export default function DashboardPage() {
                         <span className="trip-card__status-dot" style={{ background: getStatusColor(trip.status) }} />
                         {getStatusLabel(trip.status)}
                       </div>
-                      <h3 className="trip-card__title">{trip.title || 'Untitled Trip'}</h3>
+                      <h3 className="trip-card__title">
+                        {trip.title || 'Untitled Trip'}
+                        {trip.shared && <span className="trip-card__shared">Shared</span>}
+                      </h3>
                       <p className="trip-card__destination">📍 {trip.destination || 'No destination'}</p>
                       {trip.start_date && (
                         <p className="trip-card__dates">
@@ -287,6 +468,67 @@ export default function DashboardPage() {
         }
 
         /* Trips */
+        .dashboard__invites {
+          padding: var(--space-4) 0 0;
+        }
+
+        .invite-count {
+          display: inline-flex;
+          align-items: center;
+          justify-content: center;
+          min-width: 24px;
+          height: 24px;
+          padding: 0 8px;
+          margin-left: var(--space-2);
+          border-radius: 999px;
+          background: var(--color-primary);
+          color: #1a1a1a;
+          font-size: var(--text-xs);
+          font-weight: 700;
+          vertical-align: middle;
+        }
+
+        .invites-list {
+          display: flex;
+          flex-direction: column;
+          gap: var(--space-3);
+          margin-top: var(--space-4);
+        }
+
+        .invite-card {
+          display: flex;
+          align-items: center;
+          gap: var(--space-4);
+          padding: var(--space-4) var(--space-5);
+          border: 1px solid var(--color-primary);
+          border-radius: var(--radius-xl);
+          background: rgba(var(--color-primary-rgb), 0.06);
+        }
+
+        .invite-card__icon { font-size: 28px; flex-shrink: 0; }
+        .invite-card__body { flex: 1; min-width: 0; }
+        .invite-card__title { font-size: var(--text-lg); margin-bottom: 2px; }
+        .invite-card__meta { font-size: var(--text-sm); color: var(--color-text-secondary); }
+        .invite-card__from { font-size: var(--text-xs); color: var(--color-text-tertiary); margin-top: 4px; }
+        .invite-card__actions { display: flex; gap: var(--space-2); flex-shrink: 0; }
+
+        .trip-card__shared {
+          display: inline-block;
+          margin-left: var(--space-2);
+          padding: 2px 8px;
+          border-radius: 999px;
+          background: var(--color-info-bg);
+          color: var(--color-info);
+          font-size: var(--text-xs);
+          font-weight: 600;
+          vertical-align: middle;
+        }
+
+        @media (max-width: 640px) {
+          .invite-card { flex-wrap: wrap; }
+          .invite-card__actions { width: 100%; justify-content: flex-end; }
+        }
+
         .dashboard__trips {
           padding: var(--space-8) 0;
         }

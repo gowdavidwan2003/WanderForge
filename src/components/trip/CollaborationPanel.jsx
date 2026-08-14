@@ -11,6 +11,7 @@ export default function CollaborationPanel({
   trip,
   days,
   activities,
+  bookings = {},
   collaborators = [],
   onlineUsers = [],
   onRefresh,
@@ -37,7 +38,10 @@ export default function CollaborationPanel({
       });
       const data = await res.json();
       if (!res.ok) throw new Error(data.error);
-      toast.success(`${inviteEmail} has been invited!`, 'Collaborator Added');
+      toast.success(
+        `Invitation sent to ${inviteEmail}. They'll see it on their dashboard.`,
+        'Invitation Sent'
+      );
       setInviteEmail('');
       setShowInviteModal(false);
       onRefresh?.();
@@ -61,14 +65,14 @@ export default function CollaborationPanel({
 
   const handleExportPDF = async () => {
     const { exportTripToPDF } = await import('@/lib/exportUtils');
-    exportTripToPDF(trip, days, activities);
+    exportTripToPDF(trip, days, activities, bookings);
     toast.success('PDF downloading...', 'Export');
     setShowExportMenu(false);
   };
 
   const handleExportCalendar = async () => {
     const { exportTripToCalendar } = await import('@/lib/exportUtils');
-    exportTripToCalendar(trip, days, activities);
+    exportTripToCalendar(trip, days, activities, bookings);
     toast.success('Calendar file downloading...', 'Export');
     setShowExportMenu(false);
   };
@@ -201,6 +205,7 @@ export default function CollaborationPanel({
                     <div className="collab-item__info">
                       <span className="collab-item__name">{c.display_name || c.email}</span>
                       <span className="collab-item__role">{c.role}</span>
+                      {!c.accepted && <span className="collab-item__pending">Pending</span>}
                     </div>
                     <button
                       className="collab-item__remove"
@@ -417,6 +422,15 @@ export default function CollaborationPanel({
           font-size: var(--text-xs);
           color: var(--color-text-tertiary);
           text-transform: capitalize;
+        }
+
+        .collab-item__pending {
+          padding: 1px 8px;
+          border-radius: 999px;
+          background: var(--color-warning-bg);
+          color: var(--color-warning);
+          font-size: var(--text-xs);
+          font-weight: 600;
         }
 
         .collab-item__remove {
