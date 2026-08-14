@@ -2,7 +2,9 @@
  * Export trip as a downloadable PDF
  * Uses jsPDF library
  */
-export async function exportTripToPDF(trip, days, activities) {
+import { accommodationTotal, nightsBetween, bookingsTotal } from './bookings';
+
+export async function exportTripToPDF(trip, days, activities, bookings = {}) {
   const { default: jsPDF } = await import('jspdf');
   const doc = new jsPDF();
 
@@ -48,10 +50,59 @@ export async function exportTripToPDF(trip, days, activities) {
   doc.setFontSize(11);
   doc.setFont('helvetica', 'normal');
 
-  const totalCost = Object.values(activities).flat().reduce((sum, a) => sum + (parseFloat(a.cost) || 0), 0);
+  const stays = bookings.stays || [];
+  const transport = bookings.transport || [];
+  const booked = bookingsTotal(stays, transport);
+  const totalCost =
+    Object.values(activities).flat().reduce((sum, a) => sum + (parseFloat(a.cost) || 0), 0) + booked.total;
   const totalActivities = Object.values(activities).flat().length;
   doc.text(`${days.length} days  ·  ${totalActivities} activities  ·  ${trip.currency || 'USD'} ${totalCost.toFixed(0)} estimated`, margin, y);
   y += 12;
+
+  // Bookings sit before the day-by-day plan: they are the fixed points a
+  // traveler checks first.
+  if (stays.length || transport.length) {
+    doc.setFontSize(13);
+    doc.setFont('helvetica', 'bold');
+    doc.setTextColor(139, 90, 43);
+    doc.text('Bookings', margin, y);
+    y += 7;
+
+    doc.setFontSize(9);
+    doc.setTextColor(90, 90, 90);
+
+    for (const s of stays) {
+      checkPageBreak(14);
+      const nights = nightsBetween(s.check_in, s.check_out);
+      doc.setFont('helvetica', 'bold');
+      doc.text(`Stay: ${s.name}`, margin + 4, y);
+      doc.setFont('helvetica', 'normal');
+      const detail = [
+        s.check_in ? `${s.check_in} to ${s.check_out || '?'}` : null,
+        nights ? `${nights} night${nights === 1 ? '' : 's'}` : null,
+        accommodationTotal(s) ? `${trip.currency || 'USD'} ${accommodationTotal(s).toFixed(0)}` : null,
+        s.address || null,
+      ].filter(Boolean).join('  ·  ');
+      y += 4.5;
+      if (detail) { doc.text(detail, margin + 8, y); y += 5.5; } else { y += 1.5; }
+    }
+
+    for (const t of transport) {
+      checkPageBreak(14);
+      doc.setFont('helvetica', 'bold');
+      doc.text(`${(t.type || 'transport').replace('_', ' ')}: ${t.from_location || '?'} to ${t.to_location || '?'}`, margin + 4, y);
+      doc.setFont('helvetica', 'normal');
+      const detail = [
+        t.departure_time ? new Date(t.departure_time).toLocaleString() : null,
+        t.cost ? `${trip.currency || 'USD'} ${Number(t.cost).toFixed(0)}` : null,
+      ].filter(Boolean).join('  ·  ');
+      y += 4.5;
+      if (detail) { doc.text(detail, margin + 8, y); y += 5.5; } else { y += 1.5; }
+    }
+
+    y += 6;
+    doc.setTextColor(51, 51, 51);
+  }
 
   // Each Day
   for (const day of days) {
@@ -159,7 +210,7 @@ export async function exportTripToPDF(trip, days, activities) {
 /**
  * Export trip as iCalendar (.ics) file
  */
-export function exportTripToCalendar(trip, days, activities) {
+export function exportTripToCalendar(trip, days, activities, bookings = {}) {
   let ical = [
     'BEGIN:VCALENDAR',
     'VERSION:2.0',
@@ -194,6 +245,40 @@ export function exportTripToCalendar(trip, days, activities) {
         'END:VEVENT'
       );
     }
+  }
+
+  // Stays become all-day events spanning the booking; transport becomes a timed
+  // event, so the whole trip lands in the traveler's calendar, not just sights.
+  for (const s of bookings.stays || []) {
+    if (!s.check_in) continue;
+    const start = s.check_in.replace(/-/g, '');
+    const end = (s.check_out || s.check_in).replace(/-/g, '');
+    ical.push(
+      'BEGIN:VEVENT',
+      `UID:stay-${s.id}@wanderforge`,
+      `DTSTART;VALUE=DATE:${start}`,
+      `DTEND;VALUE=DATE:${end}`,
+      `SUMMARY:${escapeIcal(`Stay: ${s.name}`)}`,
+      s.address ? `LOCATION:${escapeIcal(s.address)}` : '',
+      s.booking_link ? `URL:${s.booking_link}` : '',
+      'CATEGORIES:accommodation',
+      'END:VEVENT'
+    );
+  }
+
+  for (const t of bookings.transport || []) {
+    if (!t.departure_time) continue;
+    const stamp = (v) => new Date(v).toISOString().replace(/[-:]/g, '').split('.')[0] + 'Z';
+    ical.push(
+      'BEGIN:VEVENT',
+      `UID:transport-${t.id}@wanderforge`,
+      `DTSTART:${stamp(t.departure_time)}`,
+      `DTEND:${stamp(t.arrival_time || t.departure_time)}`,
+      `SUMMARY:${escapeIcal(`${(t.type || 'Transport').replace('_', ' ')}: ${t.from_location || '?'} to ${t.to_location || '?'}`)}`,
+      t.booking_link ? `URL:${t.booking_link}` : '',
+      'CATEGORIES:transport',
+      'END:VEVENT'
+    );
   }
 
   ical.push('END:VCALENDAR');

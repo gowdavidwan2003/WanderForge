@@ -5,6 +5,7 @@ import { useRouter } from 'next/navigation';
 import { useAuth } from '@/context/AuthProvider';
 import { useToast } from '@/components/ui/Toast';
 import { getSupabaseBrowserClient } from '@/lib/supabase/client';
+import { withTimeout } from '@/lib/withTimeout';
 import Button from '@/components/ui/Button';
 import Input from '@/components/ui/Input';
 import Modal from '@/components/ui/Modal';
@@ -13,6 +14,13 @@ import DynamicMap from '@/components/maps/DynamicMap';
 import CollaborationPanel from '@/components/trip/CollaborationPanel';
 import AIChatPanel from '@/components/trip/AIChatPanel';
 import { useRealtimeTrip } from '@/hooks/useRealtimeTrip';
+import ExpenseSplitPanel from '@/components/trip/ExpenseSplitPanel';
+import ConflictCheckPanel from '@/components/trip/ConflictCheckPanel';
+import { formatMoney, inferCurrency } from '@/lib/currency';
+import NearbyPlacesPanel from '@/components/trip/NearbyPlacesPanel';
+import BookingsPanel from '@/components/trip/BookingsPanel';
+import { bookingsTotal } from '@/lib/bookings';
+import { replanDay } from '@/lib/replanDay';
 
 const CATEGORY_CONFIG = {
   sightseeing: { icon: '🏛️', color: '#6366F1', label: 'Sightseeing' },
@@ -42,6 +50,16 @@ export default function TripEditorPage({ params }) {
   const [selectedActivityId, setSelectedActivityId] = useState(null);
   const [collaborators, setCollaborators] = useState([]);
   const [showChat, setShowChat] = useState(false);
+  const [deletingActivity, setDeletingActivity] = useState(null);
+  const [showExpenses, setShowExpenses] = useState(false);
+  const [showConflicts, setShowConflicts] = useState(false);
+  const [locating, setLocating] = useState(null);
+  const [showNearby, setShowNearby] = useState(false);
+  const [showBookings, setShowBookings] = useState(false);
+  const [replanningDay, setReplanningDay] = useState(false);
+  const [togglingLock, setTogglingLock] = useState(false);
+  const [stays, setStays] = useState([]);
+  const [transport, setTransport] = useState([]);
   const [activityForm, setActivityForm] = useState({
     title: '', description: '', location_name: '', category: 'sightseeing',
     start_time: '', end_time: '', cost: '', notes: '', booking_link: '',
@@ -54,35 +72,79 @@ export default function TripEditorPage({ params }) {
     fetchTripData();
   }, []);
 
-  const { onlineUsers } = useRealtimeTrip(id, handleRealtimeUpdate);
+  const { onlineUsers } = useRealtimeTrip(id, handleRealtimeUpdate, days.map(d => d.id));
 
-  const { user } = useAuth();
+  const { user, loading: authLoading } = useAuth();
   const toast = useToast();
   const router = useRouter();
   const supabase = getSupabaseBrowserClient();
 
   useEffect(() => {
-    if (!user || !id) return;
+    // Same trap as the dashboard: bailing out while auth is unresolved without
+    // clearing `loading` left "Loading your trip..." on screen permanently.
+    if (authLoading || !id) return;
+
+    if (!user) {
+      setLoading(false);
+      router.replace(`/auth/login?redirect=%2Ftrip%2F${id}`);
+      return;
+    }
+
     fetchTripData();
     fetchCollaborators();
-  }, [user, id]);
+    fetchBookings();
+    // Keyed on the user id, not the user object — a token refresh returns a new
+    // object each cycle and would otherwise reload the whole trip every time.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [user?.id, authLoading, id]);
 
   const fetchCollaborators = async () => {
-    const { data } = await supabase
+    // trip_collaborators.user_id references auth.users, not profiles, so PostgREST
+    // cannot embed profiles here — the old `select('*, profiles(...)')` returned
+    // PGRST200 on every call and left the list permanently empty. Join manually.
+    const { data: rows, error } = await supabase
       .from('trip_collaborators')
-      .select('*, profiles(display_name, email)')
+      .select('*')
       .eq('trip_id', id);
-    setCollaborators((data || []).map(c => ({
+
+    if (error) {
+      console.error('[WanderForge] Failed to load collaborators:', error);
+      toast.error('Could not load collaborators', 'Collaboration');
+      return;
+    }
+    if (!rows?.length) {
+      setCollaborators([]);
+      return;
+    }
+
+    const { data: people } = await supabase
+      .from('profiles')
+      .select('id, display_name, email')
+      .in('id', rows.map(r => r.user_id));
+
+    const byId = Object.fromEntries((people || []).map(p => [p.id, p]));
+    setCollaborators(rows.map(c => ({
       ...c,
-      display_name: c.profiles?.display_name,
-      email: c.profiles?.email,
+      display_name: byId[c.user_id]?.display_name,
+      email: byId[c.user_id]?.email,
     })));
+  };
+
+  const fetchBookings = async () => {
+    const [a, t] = await Promise.all([
+      supabase.from('accommodations').select('*').eq('trip_id', id),
+      supabase.from('transport_bookings').select('*').eq('trip_id', id),
+    ]);
+    setStays(a.data || []);
+    setTransport(t.data || []);
   };
 
   const fetchTripData = async () => {
     try {
-      const { data: tripData, error: tripErr } = await supabase
-        .from('trips').select('*').eq('id', id).single();
+      const { data: tripData, error: tripErr } = await withTimeout(
+        supabase.from('trips').select('*').eq('id', id).single(),
+        'Loading this trip'
+      );
       if (tripErr) throw tripErr;
       setTrip(tripData);
 
@@ -125,16 +187,122 @@ export default function TripEditorPage({ params }) {
     } catch { /* ignore */ }
   };
 
-  // Geocode location
-  const geocodeLocation = async (query) => {
+  // Geocode a place name, biased toward the trip's destination.
+  const geocodeLocation = async (query, near = null) => {
     try {
-      const res = await fetch(`/api/geocode?q=${encodeURIComponent(query)}`);
+      const params = new URLSearchParams({ q: query });
+      if (near?.lat != null && near?.lng != null) {
+        params.set('lat', near.lat);
+        params.set('lng', near.lng);
+      }
+      const res = await fetch(`/api/geocode?${params}`);
       const data = await res.json();
       return data.results?.[0] || null;
     } catch { return null; }
   };
 
+  // Locate every activity that has a place name but no coordinates. Existing
+  // trips were generated when geocoding silently failed for all of them, so this
+  // repairs them in place rather than requiring a full regenerate.
+  // Manual adds and picker adds both append to the end of a day. This rebuilds
+  // the day so ordering, timings and travel make sense again.
+  const handleToggleLock = async () => {
+    setTogglingLock(true);
+    const next = !trip.itinerary_locked;
+    const { data, error } = await supabase
+      .from('trips')
+      .update({ itinerary_locked: next })
+      .eq('id', id)
+      .select()
+      .single();
+    setTogglingLock(false);
+
+    if (error) {
+      // The database trigger rejects lock changes from anyone but the owner.
+      return toast.error(error.message, next ? 'Could not lock' : 'Could not unlock');
+    }
+    setTrip(data);
+    toast.success(
+      next
+        ? 'The itinerary is frozen. Nobody can edit it until you unlock it.'
+        : 'The itinerary is editable again.',
+      next ? 'Itinerary Locked 🔒' : 'Itinerary Unlocked'
+    );
+  };
+
+  const handleReplanSelectedDay = async () => {
+    if (blockedByLock() || !selectedDay) return;
+    setReplanningDay(true);
+    const result = await replanDay(supabase, {
+      trip,
+      day: selectedDay,
+      keep: activities[selectedDay.id] || [],
+    });
+    setReplanningDay(false);
+
+    if (!result.ok) return toast.error(result.error, 'Replan failed');
+    toast.success(
+      `Day ${selectedDay.day_number} rebuilt — ${result.count} entries, times and travel sorted.`,
+      result.theme || 'Day Replanned'
+    );
+    fetchTripData();
+  };
+
+  const handleLocateActivities = async () => {
+    if (blockedByLock()) return;
+    const pending = Object.values(activities).flat()
+      .filter(a => a.location_name && (a.latitude == null || a.longitude == null));
+
+    if (pending.length === 0) {
+      toast.info('Every activity with a location is already on the map.', 'Nothing to do');
+      return;
+    }
+
+    setLocating({ done: 0, total: pending.length });
+
+    // Resolve the destination first so it can bias the per-activity lookups.
+    let center = trip.dest_lat != null ? { lat: trip.dest_lat, lng: trip.dest_lng } : null;
+    if (!center && trip.destination) {
+      const destHit = await geocodeLocation(trip.destination);
+      if (destHit) {
+        center = { lat: destHit.lat, lng: destHit.lng };
+        await supabase.from('trips')
+          .update({ dest_lat: destHit.lat, dest_lng: destHit.lng })
+          .eq('id', trip.id);
+      }
+    }
+
+    let located = 0;
+    for (let i = 0; i < pending.length; i++) {
+      const act = pending[i];
+      const hit = await geocodeLocation(act.location_name, center);
+      if (hit) {
+        await supabase.from('activities')
+          .update({ latitude: hit.lat, longitude: hit.lng })
+          .eq('id', act.id);
+        located++;
+      }
+      setLocating({ done: i + 1, total: pending.length });
+    }
+
+    setLocating(null);
+    toast.success(`Located ${located} of ${pending.length} activities.`, 'Map Updated');
+    fetchTripData();
+  };
+
+  // Every itinerary mutation checks the lock first, so a stale page can't slip an
+  // edit past. The database would reject it anyway; this gives a clear message.
+  const blockedByLock = () => {
+    if (!trip?.itinerary_locked) return false;
+    toast.error(
+      'This itinerary is locked. The trip owner must unlock it before changes can be made.',
+      'Locked 🔒'
+    );
+    return true;
+  };
+
   const openAddActivity = () => {
+    if (blockedByLock()) return;
     setEditingActivity(null);
     setActivityForm({
       title: '', description: '', location_name: '', category: 'sightseeing',
@@ -145,6 +313,7 @@ export default function TripEditorPage({ params }) {
   };
 
   const openEditActivity = (activity) => {
+    if (blockedByLock()) return;
     setEditingActivity(activity);
     setActivityForm({
       title: activity.title || '', description: activity.description || '',
@@ -165,7 +334,10 @@ export default function TripEditorPage({ params }) {
     let lng = activityForm.longitude ? parseFloat(activityForm.longitude) : null;
 
     if (activityForm.location_name && (!lat || !lng)) {
-      const geo = await geocodeLocation(`${activityForm.location_name}, ${trip?.destination}`);
+      const geo = await geocodeLocation(
+        activityForm.location_name,
+        trip?.dest_lat != null ? { lat: trip.dest_lat, lng: trip.dest_lng } : null
+      );
       if (geo) {
         lat = geo.lat;
         lng = geo.lng;
@@ -205,14 +377,38 @@ export default function TripEditorPage({ params }) {
     } catch (err) { toast.error(err.message); }
   };
 
-  const handleDeleteActivity = async (activityId) => {
-    if (!confirm('Delete this activity?')) return;
-    await supabase.from('activities').delete().eq('id', activityId);
-    toast.success('Deleted');
-    fetchTripData();
+  const confirmDeleteActivity = async () => {
+    if (blockedByLock()) return;
+    const activity = deletingActivity;
+    if (!activity) return;
+    setDeletingActivity(null);
+    try {
+      // .select() makes PostgREST return the rows it actually removed. Without it a
+      // delete that RLS filtered to zero rows resolves without an error, so the UI
+      // reported success while the activity was still there.
+      const { data, error } = await supabase
+        .from('activities')
+        .delete()
+        .eq('id', activity.id)
+        .select();
+
+      if (error) throw error;
+      if (!data || data.length === 0) {
+        throw new Error(
+          'That activity could not be deleted. You may not have edit permission on this trip.'
+        );
+      }
+
+      toast.success('Activity deleted');
+      if (selectedActivityId === activity.id) setSelectedActivityId(null);
+      fetchTripData();
+    } catch (err) {
+      toast.error(err.message || 'Failed to delete activity', 'Delete Failed');
+    }
   };
 
   const handleMoveActivity = async (activityId, direction) => {
+    if (blockedByLock()) return;
     if (!selectedDay) return;
     const dayActs = [...(activities[selectedDay.id] || [])];
     const idx = dayActs.findIndex(a => a.id === activityId);
@@ -227,6 +423,7 @@ export default function TripEditorPage({ params }) {
 
   // AI Generate itinerary
   const handleAIGenerate = async () => {
+    if (blockedByLock()) return;
     if (!trip) return;
     setAiGenerating(true);
     try {
@@ -258,7 +455,12 @@ export default function TripEditorPage({ params }) {
           // Geocode each activity
           let lat = null, lng = null;
           if (act.location_name) {
-            const geo = await geocodeLocation(`${act.location_name}, ${trip.destination}`);
+            // location_name usually already carries the town; appending the
+            // destination again produced queries no geocoder could match.
+            const geo = await geocodeLocation(
+              act.location_name,
+              trip.dest_lat != null ? { lat: trip.dest_lat, lng: trip.dest_lng } : null
+            );
             if (geo) { lat = geo.lat; lng = geo.lng; }
           }
 
@@ -279,6 +481,13 @@ export default function TripEditorPage({ params }) {
             longitude: lng,
           });
         }
+      }
+
+      // The AI reports the destination's local currency. Adopt it so costs are no
+      // longer labelled with whatever the wizard dropdown happened to default to.
+      const detected = data.currency || inferCurrency(trip.destination);
+      if (detected && detected !== trip.currency) {
+        await supabase.from('trips').update({ currency: detected }).eq('id', trip.id);
       }
 
       // Also geocode destination for weather
@@ -314,7 +523,16 @@ export default function TripEditorPage({ params }) {
 
   const selectedDayActivities = selectedDay ? (activities[selectedDay.id] || []) : [];
   const allActivities = Object.values(activities).flat();
-  const totalCost = allActivities.reduce((sum, a) => sum + (parseFloat(a.cost) || 0), 0);
+  const activityCost = allActivities.reduce((sum, a) => sum + (parseFloat(a.cost) || 0), 0);
+  // Accommodation and transport are real trip spend, so they belong in the total
+  // the traveler is comparing against their budget.
+  const booked = bookingsTotal(stays, transport);
+  const totalCost = activityCost + booked.total;
+  // Fall back to the destination when the trip has no stored currency yet.
+  const tripCurrency = trip.currency || inferCurrency(trip.destination) || 'USD';
+  // The lock is enforced by RLS as well; this only drives the UI.
+  const isLocked = !!trip.itinerary_locked;
+  const isOwner = trip.user_id === user?.id;
   const selectedDayWeather = weather && selectedDay?.date
     ? weather.find(w => w.date === selectedDay.date) : null;
 
@@ -337,7 +555,7 @@ export default function TripEditorPage({ params }) {
                       {trip.end_date && ` — ${new Date(trip.end_date).toLocaleDateString('en-US', { month: 'short', day: 'numeric', year: 'numeric' })}`}
                     </span>
                   )}
-                  <span>💰 {trip.currency} {totalCost.toFixed(0)} spent{trip.total_budget ? ` / ${parseFloat(trip.total_budget).toFixed(0)} budget` : ''}</span>
+                  <span>💰 {formatMoney(totalCost, tripCurrency)} spent{trip.total_budget ? ` / ${formatMoney(trip.total_budget, tripCurrency)} budget` : ''}</span>
                   <span>📋 {allActivities.length} activities</span>
                 </div>
               </div>
@@ -348,15 +566,74 @@ export default function TripEditorPage({ params }) {
                   days={days}
                   activities={activities}
                   collaborators={collaborators}
+                  bookings={{ stays, transport }}
                   onlineUsers={onlineUsers}
                   onRefresh={() => { fetchCollaborators(); fetchTripData(); }}
                 />
+                {isOwner && (
+                  <Button
+                    variant={isLocked ? 'primary' : 'ghost'}
+                    size="sm"
+                    onClick={handleToggleLock}
+                    loading={togglingLock}
+                    disabled={togglingLock}
+                    icon={<span>{isLocked ? '🔒' : '🔓'}</span>}
+                    title={isLocked
+                      ? 'Unlock so the group can edit the itinerary again'
+                      : 'Freeze the itinerary so nobody can change it'}
+                  >
+                    {isLocked ? 'Unlock' : 'Lock'}
+                  </Button>
+                )}
+                <Button
+                  variant="ghost"
+                  size="sm"
+                  onClick={() => setShowNearby(true)}
+                  disabled={isLocked}
+                  icon={<span>🧭</span>}
+                >
+                  Find Nearby
+                </Button>
+                <Button
+                  variant="ghost"
+                  size="sm"
+                  onClick={() => setShowBookings(true)}
+                  icon={<span>🏨</span>}
+                >
+                  Bookings
+                </Button>
+                <Button
+                  variant="ghost"
+                  size="sm"
+                  onClick={handleLocateActivities}
+                  loading={!!locating}
+                  disabled={!!locating || isLocked}
+                  icon={<span>📍</span>}
+                >
+                  {locating ? `Locating ${locating.done}/${locating.total}` : 'Locate on Map'}
+                </Button>
+                <Button
+                  variant="ghost"
+                  size="sm"
+                  onClick={() => setShowConflicts(true)}
+                  icon={<span>🔍</span>}
+                >
+                  Check Itinerary
+                </Button>
+                <Button
+                  variant="ghost"
+                  size="sm"
+                  onClick={() => setShowExpenses(true)}
+                  icon={<span>🧾</span>}
+                >
+                  Split Bills
+                </Button>
                 <Button
                   variant="primary"
                   size="sm"
                   onClick={handleAIGenerate}
                   loading={aiGenerating}
-                  disabled={aiGenerating}
+                  disabled={aiGenerating || isLocked}
                   icon={<span>🤖</span>}
                 >
                   {aiGenerating ? 'Generating...' : 'AI Generate'}
@@ -365,6 +642,23 @@ export default function TripEditorPage({ params }) {
             </div>
           </div>
         </div>
+
+        {isLocked && (
+          <div className="container">
+            <div className="lock-banner">
+              <span className="lock-banner__icon">🔒</span>
+              <div>
+                <strong className="lock-banner__title">Itinerary locked</strong>
+                <span className="lock-banner__text">
+                  {isOwner
+                    ? 'You froze this plan. Unlock it to make changes.'
+                    : 'The trip owner has frozen this plan. Ask them to unlock it to make changes.'}
+                  {' '}Splitting bills still works as normal.
+                </span>
+              </div>
+            </div>
+          </div>
+        )}
 
         {/* Map Section */}
         <div className="editor__map-section">
@@ -430,7 +724,20 @@ export default function TripEditorPage({ params }) {
                             <span className="weather-badge__desc">{selectedDayWeather.description}</span>
                           </div>
                         )}
-                        <Button variant="primary" size="sm" onClick={openAddActivity}
+                        {selectedDayActivities.length > 0 && (
+                          <Button
+                            variant="ghost"
+                            size="sm"
+                            onClick={handleReplanSelectedDay}
+                            loading={replanningDay}
+                            disabled={replanningDay || isLocked}
+                            icon={<span>🔄</span>}
+                            title="Rebuild this day around everything on it: order, timings and travel"
+                          >
+                            Replan Day
+                          </Button>
+                        )}
+                        <Button variant="primary" size="sm" onClick={openAddActivity} disabled={isLocked}
                           icon={<svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5"><line x1="12" y1="5" x2="12" y2="19"/><line x1="5" y1="12" x2="19" y2="12"/></svg>}
                         >
                           Add
@@ -444,7 +751,7 @@ export default function TripEditorPage({ params }) {
                         <h3>No activities yet</h3>
                         <p>Click &quot;AI Generate&quot; to auto-fill, or add manually</p>
                         <div style={{ display: 'flex', gap: '8px', justifyContent: 'center', marginTop: '12px' }}>
-                          <Button variant="primary" size="sm" onClick={openAddActivity}>+ Add Manually</Button>
+                          <Button variant="primary" size="sm" onClick={openAddActivity} disabled={isLocked}>+ Add Manually</Button>
                           <Button variant="secondary" size="sm" onClick={handleAIGenerate} loading={aiGenerating}>🤖 AI Fill</Button>
                         </div>
                       </div>
@@ -467,18 +774,18 @@ export default function TripEditorPage({ params }) {
                                   <span className="activity-card__category" style={{ background: `${cat.color}18`, color: cat.color }}>
                                     {cat.icon} {cat.label}
                                   </span>
-                                  <div className="activity-card__actions">
+                                  <div className="activity-card__actions" hidden={isLocked}>
                                     {idx > 0 && <button className="act-btn" onClick={(e) => { e.stopPropagation(); handleMoveActivity(activity.id, 'up'); }}>↑</button>}
                                     {idx < selectedDayActivities.length - 1 && <button className="act-btn" onClick={(e) => { e.stopPropagation(); handleMoveActivity(activity.id, 'down'); }}>↓</button>}
                                     <button className="act-btn" onClick={(e) => { e.stopPropagation(); openEditActivity(activity); }}>✏️</button>
-                                    <button className="act-btn act-btn--danger" onClick={(e) => { e.stopPropagation(); handleDeleteActivity(activity.id); }}>🗑️</button>
+                                    <button className="act-btn act-btn--danger" onClick={(e) => { e.stopPropagation(); setDeletingActivity(activity); }}>🗑️</button>
                                   </div>
                                 </div>
                                 <h3 className="activity-card__title">{activity.title}</h3>
                                 {activity.location_name && <p className="activity-card__location">📍 {activity.location_name}</p>}
                                 <div className="activity-card__details">
                                   {activity.start_time && <span>🕐 {activity.start_time?.slice(0, 5)}{activity.end_time && ` – ${activity.end_time.slice(0, 5)}`}</span>}
-                                  {parseFloat(activity.cost) > 0 && <span>💰 {trip.currency} {parseFloat(activity.cost).toFixed(0)}</span>}
+                                  {parseFloat(activity.cost) > 0 && <span>💰 {formatMoney(activity.cost, tripCurrency)}</span>}
                                   {activity.latitude && <span className="activity-card__mapped">🗺️ Mapped</span>}
                                 </div>
                                 {activity.description && <p className="activity-card__desc">{activity.description}</p>}
@@ -536,6 +843,59 @@ export default function TripEditorPage({ params }) {
         </div>
       </Modal>
 
+      {/* Delete confirmation — replaces window.confirm(), which some browsers
+          suppress entirely, silently cancelling the delete. */}
+      <Modal
+        isOpen={!!deletingActivity}
+        onClose={() => setDeletingActivity(null)}
+        title="Delete Activity"
+      >
+        <div style={{ display: 'flex', flexDirection: 'column', gap: 'var(--space-5)' }}>
+          <p style={{ color: 'var(--color-text-secondary)', fontSize: 'var(--text-sm)' }}>
+            Delete <strong style={{ color: 'var(--color-text)' }}>{deletingActivity?.title}</strong>? This cannot be undone.
+          </p>
+          <div style={{ display: 'flex', justifyContent: 'flex-end', gap: 'var(--space-3)' }}>
+            <Button variant="ghost" onClick={() => setDeletingActivity(null)}>Cancel</Button>
+            <Button variant="primary" onClick={confirmDeleteActivity}>Delete</Button>
+          </div>
+        </div>
+      </Modal>
+
+      <NearbyPlacesPanel
+        trip={{ ...trip, currency: tripCurrency }}
+        days={days}
+        activities={activities}
+        selectedDay={selectedDay}
+        isOpen={showNearby}
+        onClose={() => setShowNearby(false)}
+        onAdded={fetchTripData}
+      />
+
+      <BookingsPanel
+        tripId={id}
+        trip={{ ...trip, currency: tripCurrency }}
+        isOpen={showBookings}
+        onClose={() => setShowBookings(false)}
+        onChanged={fetchBookings}
+      />
+
+      <ExpenseSplitPanel
+        tripId={id}
+        trip={{ ...trip, currency: tripCurrency }}
+        collaborators={collaborators}
+        isOpen={showExpenses}
+        onClose={() => setShowExpenses(false)}
+      />
+
+      <ConflictCheckPanel
+        trip={{ ...trip, currency: tripCurrency }}
+        days={days}
+        activities={activities}
+        isOpen={showConflicts}
+        onClose={() => setShowConflicts(false)}
+        onReplanned={fetchTripData}
+      />
+
       {/* AI Chat Panel */}
       <AIChatPanel
         trip={trip}
@@ -543,6 +903,7 @@ export default function TripEditorPage({ params }) {
         activities={activities}
         isOpen={showChat}
         onClose={() => setShowChat(false)}
+        onApplied={fetchTripData}
       />
 
       {/* Floating Chat FAB */}
@@ -630,6 +991,17 @@ export default function TripEditorPage({ params }) {
         .day-tab__top { display: flex; justify-content: space-between; width: 100%; align-items: center; }
         .day-tab__number { font-weight: 600; font-size: var(--text-sm); color: var(--color-text); }
         .day-tab--selected .day-tab__number { color: var(--color-primary); }
+        .lock-banner {
+          display: flex; align-items: center; gap: var(--space-3);
+          margin: var(--space-4) 0 0;
+          padding: var(--space-3) var(--space-4);
+          border: 1px solid var(--color-warning);
+          border-radius: var(--radius-lg);
+          background: var(--color-warning-bg);
+        }
+        .lock-banner__icon { font-size: 20px; }
+        .lock-banner__title { display: block; font-size: var(--text-sm); }
+        .lock-banner__text { font-size: var(--text-xs); color: var(--color-text-secondary); }
         .day-tab__weather { font-size: 16px; }
         .day-tab__date { font-size: var(--text-xs); color: var(--color-text-tertiary); }
         .day-tab__count { font-size: var(--text-xs); color: var(--color-text-tertiary); }
@@ -671,8 +1043,13 @@ export default function TripEditorPage({ params }) {
         .activity-card:hover { border-color: var(--color-primary-light); box-shadow: var(--shadow-sm); }
         .activity-card__header { display: flex; justify-content: space-between; align-items: center; margin-bottom: var(--space-1); }
         .activity-card__category { display: inline-flex; align-items: center; gap: 4px; padding: 2px 8px; border-radius: var(--radius-full); font-size: 11px; font-weight: 600; }
-        .activity-card__actions { display: flex; gap: 3px; opacity: 0; transition: opacity var(--transition-fast); }
-        .activity-card:hover .activity-card__actions { opacity: 1; }
+        /* Faded until hover on pointer devices, but always fully visible on touch —
+           hover never fires there, so the edit/delete buttons were unreachable. */
+        .activity-card__actions { display: flex; gap: 3px; opacity: 1; transition: opacity var(--transition-fast); }
+        @media (hover: hover) {
+          .activity-card__actions { opacity: 0.35; }
+          .activity-card:hover .activity-card__actions { opacity: 1; }
+        }
 
         .act-btn {
           width: 26px; height: 26px; border-radius: var(--radius-sm);

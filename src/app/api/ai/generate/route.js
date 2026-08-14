@@ -1,4 +1,6 @@
 import { NextResponse } from 'next/server';
+import { groqChatCompletion } from '@/lib/groq';
+import { REALISM_RULES, TRANSPORT_INFO, BUDGET_INFO } from '@/lib/itineraryPrompt';
 
 export async function POST(request) {
   try {
@@ -13,43 +15,11 @@ export async function POST(request) {
       userApiKey,
     } = body;
 
-    // Use user's own key or fallback to default Groq key
-    const apiKey = userApiKey || process.env.GROQ_API_KEY;
-    if (!apiKey) {
-      return NextResponse.json(
-        { error: 'No API key available. Please add your own Groq key in Settings.' },
-        { status: 400 }
-      );
-    }
 
-    const transportInfo = {
-      car: 'traveling by car (can cover longer distances between activities)',
-      public_transit: 'using public transit (consider transit schedules and routes)',
-      bike: 'cycling (keep activities within cycling distance)',
-      walking: 'on foot (keep activities close together and walkable)',
-      flight: 'flying between major destinations',
-      mixed: 'using a mix of transport (walking for close-by, transit/car for further)',
-    };
+    const transportInfo = TRANSPORT_INFO;
+    const budgetInfo = BUDGET_INFO;
 
-    const budgetInfo = {
-      budget: 'budget-friendly options, street food, free attractions, hostels',
-      moderate: 'balanced mix of paid and free, mid-range restaurants, 3-star hotels',
-      luxury: 'premium experiences, fine dining, 5-star hotels, VIP tours',
-    };
-
-    const systemPrompt = `You are WanderForge AI, an expert travel planner. You create optimized itineraries that PRIORITIZE:
-1. EXPERIENCE - Unforgettable, authentic activities
-2. TIME - Minimize wasted time on transit, logical geographic ordering
-3. MONEY - Best value for the budget level
-
-Rules:
-- Group geographically close activities together in the same day
-- Schedule outdoor activities in the morning, indoor in afternoon for flexibility
-- Include estimated costs in local currency
-- Include specific location names and addresses when possible
-- Add practical notes (best time to visit, avoid crowds tips)
-- Consider opening hours and seasonal factors
-- Suggest realistic time slots with travel time between activities`;
+    const systemPrompt = REALISM_RULES;
 
     const userPrompt = `Create a detailed ${days}-day itinerary for ${destination}.
 
@@ -57,6 +27,10 @@ Transport: ${transportInfo[transportMode] || transportInfo.mixed}
 Budget: ${budgetInfo[budgetLevel] || budgetInfo.moderate}
 Interests: ${interests.length > 0 ? interests.join(', ') : 'general sightseeing and culture'}
 ${notes ? `Additional notes: ${notes}` : ''}
+
+Plan each of the ${days} days to make good use of the day, but ONLY with activities that are genuinely achievable given real travel times between the specific places you choose. Include meals at natural times.
+
+Then verify each day hour by hour: for every consecutive pair, is there enough time to actually get from the first place to the second by ${transportMode === 'mixed' ? 'the available transport' : transportMode}, including parking and walking? Any hop over 45 minutes must be its own "transport" entry. If a day does not survive that check, remove activities until it does - a shorter, achievable day is the correct answer.
 
 RESPOND IN THIS EXACT JSON FORMAT (no other text, just JSON):
 {
@@ -85,40 +59,53 @@ RESPOND IN THIS EXACT JSON FORMAT (no other text, just JSON):
   "pro_tips": ["tip1", "tip2", "tip3"]
 }`;
 
-    const response = await fetch('https://api.groq.com/openai/v1/chat/completions', {
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-        Authorization: `Bearer ${apiKey}`,
-      },
-      body: JSON.stringify({
+    const result = await groqChatCompletion({
         model: 'llama-3.3-70b-versatile',
         messages: [
           { role: 'system', content: systemPrompt },
           { role: 'user', content: userPrompt },
         ],
-        temperature: 0.7,
-        max_tokens: 8000,
+        // Lower temperature keeps distance and duration estimates grounded rather
+        // than creative. No max_tokens: it capped long itineraries, and Groq
+        // reserves the full value against the per-minute token limit up front,
+        // which was causing spurious rate-limit errors on back-to-back requests.
+        temperature: 0.4,
         response_format: { type: 'json_object' },
-      }),
-    });
+    }, { userApiKey });
 
-    if (!response.ok) {
-      const errorData = await response.json().catch(() => ({}));
-      return NextResponse.json(
-        { error: errorData.error?.message || `Groq API error: ${response.status}` },
-        { status: response.status }
-      );
+    if (!result.ok) {
+      return NextResponse.json({ error: result.error }, { status: result.status });
     }
 
-    const data = await response.json();
-    const content = data.choices?.[0]?.message?.content;
+    const data = result.data;
+    const choice = data.choices?.[0];
+    const content = choice?.message?.content;
 
     if (!content) {
       return NextResponse.json({ error: 'No response from AI' }, { status: 500 });
     }
 
-    const itinerary = JSON.parse(content);
+    // Full-day itineraries are long. If the model hit the token ceiling the JSON is
+    // cut off mid-object, so report that plainly instead of a bare parse error.
+    if (choice.finish_reason === 'length') {
+      return NextResponse.json(
+        {
+          error: `The itinerary was too long to finish (${days} days). Try generating fewer days at a time.`,
+        },
+        { status: 502 }
+      );
+    }
+
+    let itinerary;
+    try {
+      itinerary = JSON.parse(content);
+    } catch {
+      return NextResponse.json(
+        { error: 'The AI returned malformed itinerary data. Please try again.' },
+        { status: 502 }
+      );
+    }
+
     return NextResponse.json(itinerary);
   } catch (err) {
     console.error('AI Generation Error:', err);

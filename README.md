@@ -1,288 +1,216 @@
 <p align="center">
-  <img src="https://img.shields.io/badge/Next.js-16-black?style=for-the-badge&logo=next.js" alt="Next.js" />
+  <img src="https://img.shields.io/badge/Next.js-16.2-black?style=for-the-badge&logo=next.js" alt="Next.js" />
   <img src="https://img.shields.io/badge/Supabase-PostgreSQL-3ECF8E?style=for-the-badge&logo=supabase" alt="Supabase" />
   <img src="https://img.shields.io/badge/AI-Groq_Llama_3.3-F55036?style=for-the-badge&logo=meta" alt="Groq AI" />
-  <img src="https://img.shields.io/badge/Maps-Leaflet-199900?style=for-the-badge&logo=leaflet" alt="Leaflet" />
-  <img src="https://img.shields.io/badge/License-MIT-blue?style=for-the-badge" alt="License" />
+  <img src="https://img.shields.io/badge/Maps-Leaflet_+_Google_Routes-199900?style=for-the-badge&logo=leaflet" alt="Maps" />
 </p>
 
 # 🧭 WanderForge — Forge Your Perfect Journey
 
-**WanderForge** is a full-stack, AI-powered travel itinerary planner that prioritizes **Experience > Time > Money**. Plan trips with AI assistance, visualize routes on interactive maps, collaborate in real-time, and export beautiful PDFs — all for free.
+An AI travel planner that only suggests things you can **actually do**. It plans day by day, checks the drive times against real roads, keeps the group in sync, and splits the bill at the end.
+
+Priority order, enforced in the AI prompt itself: **Achievable → Experience → Money.**
 
 <p align="center">
-  <img src="https://img.shields.io/badge/Status-Active_Development-brightgreen?style=flat-square" />
+  <img src="https://img.shields.io/badge/Status-Prototype-orange?style=flat-square" />
+  <img src="https://img.shields.io/badge/Production_Ready-4%2F10-red?style=flat-square" />
   <img src="https://img.shields.io/badge/Pages-8-blue?style=flat-square" />
-  <img src="https://img.shields.io/badge/API_Routes-7-purple?style=flat-square" />
-  <img src="https://img.shields.io/badge/Templates-30-orange?style=flat-square" />
+  <img src="https://img.shields.io/badge/API_Routes-10-purple?style=flat-square" />
+  <img src="https://img.shields.io/badge/Migrations-6-informational?style=flat-square" />
 </p>
+
+> ⚠️ **Not production-ready.** Works well end-to-end, but several hard blockers remain.
+> See [Production Readiness](#-production-readiness) before deploying. Read it first.
 
 ---
 
 ## ✨ Features
 
-### 🤖 AI-Powered Planning
-- **Smart Itinerary Generation** — Groq AI (Llama 3.3 70B) creates optimized day-by-day plans
-- **Conversational AI Chat** — Ask questions, get local tips, and refine your itinerary
-- **BYOK Support** — Bring Your Own API Key for unlimited AI access
-- **Auto-Geocoding** — Every activity is automatically mapped to coordinates
+### 🤖 AI planning that respects reality
 
-### 🗺️ Interactive Maps
-- **Leaflet + OpenStreetMap** — Beautiful, free, interactive maps
-- **Category-Colored Markers** — 11 activity categories with unique emoji markers
-- **Route Visualization** — OpenRouteService routing with dashed polylines
-- **Map ↔ Timeline Sync** — Click activities to highlight on the map and vice versa
+The generation prompt is built around one rule: **a plan that looks full but can't be executed is worthless.**
 
-### 🌤️ Weather & Budget
-- **7-Day Forecasts** — Open-Meteo weather widgets on each day tab
-- **Budget Tracking** — Real-time cost tracking with multi-currency support
-- **Smart Suggestions** — AI considers weather and budget in its recommendations
+- **Full-day itineraries** — 08:00 to ~21:00, contiguous, with all three meals at named venues
+- **Realistic travel time** — explicit speed models by terrain. Hill/ghat roads are 25–30 km/h, so a 40 km mountain road is 1.5 hours, not 30 minutes. Parking, walk-in and ticket queues are added on top
+- **Journeys are visible** — any hop over 45 minutes becomes its own `transport` entry, including the return leg
+- **Honest durations** — a peak trek is 3–5 hours *on the mountain* plus travel each way, and consumes the day it needs
+- **Fewer, achievable entries beat more, impossible ones** — the model is told to drop activities rather than compress travel
 
-### 👥 Real-Time Collaboration
-- **Live Editing** — Multiple users can edit the same trip simultaneously
-- **Presence Indicators** — See who's online with colored avatars
-- **Role-Based Access** — Invite as Editor or Viewer
-- **Supabase Realtime** — Powered by WebSocket channels
+### 🔄 Replanning at three scopes
 
-### 📄 Export & Share
-- **PDF Export** — Styled itinerary with day sections, times, and costs
-- **Calendar Export** — .ics files for Google Calendar & Outlook
-- **Share Links** — Copy trip URL to clipboard
+Adding one activity can't produce a coherent day, so replanning is explicit and shared by every entry point:
 
-### 🎨 Design
-- **Wanderlust Theme** — Earthy tones, glassmorphism, micro-animations
-- **Dark/Light Mode** — System-aware theme with manual toggle
-- **Fully Responsive** — Works on mobile, tablet, laptop, and TV
-- **30 Curated Templates** — Pre-made itineraries for the world's most visited destinations
+| Scope | Trigger | What it does |
+|---|---|---|
+| **Day** | 🔄 Replan Day, or from the nearby picker | Rebuilds one day around everything on it |
+| **Day (auto)** | AI chat → Apply | Weaves requested places into the day |
+| **Whole trip** | Conflict checker *(currently disabled)* | Redistributes across days when a clash can't be fixed within one |
+
+**Nothing is ever silently lost.** Every replan validates that each place survives, and refuses to write if not:
+
+- Dropped places → confirmation listing exactly which
+- Two places merged into one entry → treated as a drop
+- Activities placed on a non-existent day → refused before any delete
+- One automatic repair pass re-prompts naming what went missing
+
+### 🗺️ Maps and routing
+
+- **Leaflet + CARTO Voyager** basemap, custom category-coloured numbered pins, route polylines
+- **Google Routes API** for real drive times, traffic-aware, with OpenRouteService fallback
+- **Google Places** for geocoding — finds venues OpenStreetMap can't ("The Planters Court"), with destination bias so results land in the right town
+- **Locate on Map** backfills coordinates for activities that lack them
+
+### 🧭 Nearby places picker
+
+Searches from the last mapped stop of the selected day. Seven categories, adjustable radius, Overpass primary with Google filling gaps. Added places carry their exact coordinates — no geocoding round-trip, no drifting pins.
+
+### 👥 Collaboration
+
+- **Invite → accept flow.** Invitations are pending until accepted; a pending invitee gets no access
+- **Shared trips appear on both dashboards** with a "Shared" badge
+- **Realtime sync** and presence via Supabase channels
+- **🔒 Itinerary lock** — the owner can freeze the plan. Enforced in RLS, not just the UI, with an owner-only database trigger so collaborators can't unlock themselves. **Bill splitting keeps working while locked**
+
+### 💰 Money
+
+- **Dynamic currency** — inferred from destination, confirmed by the AI, formatted properly (₹1,500 not USD 1500)
+- **Bill splitting** — equal, by exact amount, or by percentage, across any number of collaborators
+- **Simplify balances** — nets debts into the fewest transfers. A owes B 1000, B owes C 2000, C owes A 1000 collapses to **B pays C 1000**
+- **Bookings** — stays and transport, feeding the budget total, the PDF and the calendar export
+
+### 📤 Export
+
+PDF itinerary (with a bookings section), `.ics` calendar including stays as all-day events and transport as timed events, and a share link.
 
 ---
 
 ## 🛠️ Tech Stack
 
-| Layer | Technology | Purpose |
-|---|---|---|
-| **Framework** | Next.js 16 (App Router) | Full-stack React with Turbopack |
-| **Database** | Supabase (PostgreSQL) | Auth, DB, Realtime, Storage |
-| **AI** | Groq (Llama 3.3 70B) | Itinerary generation & chat |
-| **Maps** | Leaflet + OpenStreetMap | Interactive map visualization |
-| **Routing** | OpenRouteService | Directions & distance calculations |
-| **Weather** | Open-Meteo | 7-day weather forecasts |
-| **Geocoding** | Nominatim | Location → coordinates |
-| **Places** | Overpass API | Nearby point-of-interest discovery |
-| **Styling** | Vanilla CSS | Custom design system with tokens |
-| **Export** | jsPDF | PDF generation |
+| Layer | Choice |
+|---|---|
+| Framework | Next.js 16.2 (App Router, Turbopack) · React 19 |
+| Database | Supabase Postgres — 12 tables, RLS on every one |
+| Auth | Supabase Auth + SSR cookies, middleware-gated routes |
+| AI | Groq `llama-3.3-70b-versatile`, JSON-mode, 3-key rotation |
+| Maps | Leaflet + CARTO tiles · Google Routes + Places · OpenRouteService fallback |
+| Places | Overpass (OSM) with Google Places fallback |
+| Weather | Open-Meteo |
+| Export | jsPDF · hand-built iCalendar |
 
-> 💡 **All APIs used are free-tier compatible** — no paid subscriptions required!
+### Notable internals
 
----
-
-## 📁 Project Structure
-
-```
-wanderforge/
-├── src/
-│   ├── app/
-│   │   ├── api/
-│   │   │   ├── ai/
-│   │   │   │   ├── generate/route.js    # AI itinerary generation
-│   │   │   │   └── chat/route.js        # Conversational AI assistant
-│   │   │   ├── collaborators/route.js   # Trip collaborator management
-│   │   │   ├── geocode/route.js         # Nominatim geocoding proxy
-│   │   │   ├── places/route.js          # Overpass API places proxy
-│   │   │   └── weather/route.js         # Open-Meteo weather proxy
-│   │   ├── auth/
-│   │   │   ├── login/page.js            # Email/password login
-│   │   │   ├── signup/page.js           # Signup with OTP verification
-│   │   │   └── callback/route.js        # OAuth callback handler
-│   │   ├── dashboard/page.js            # Trip cards, stats, welcome
-│   │   ├── explore/page.js              # 30 destination templates
-│   │   ├── profile/[id]/page.js         # User profile + BYOK keys
-│   │   ├── trip/
-│   │   │   ├── new/page.js              # 4-step creation wizard
-│   │   │   └── [id]/page.js             # Full trip editor
-│   │   ├── globals.css                  # Design system & tokens
-│   │   ├── layout.js                    # Root layout with providers
-│   │   └── page.js                      # Landing page
-│   ├── components/
-│   │   ├── layout/                      # Navbar, Footer
-│   │   ├── maps/                        # TripMap, DynamicMap
-│   │   ├── trip/                        # CollaborationPanel, AIChatPanel
-│   │   └── ui/                          # Button, Input, Modal, Toast, etc.
-│   ├── context/                         # AuthProvider, ThemeProvider
-│   ├── hooks/                           # useRealtimeTrip
-│   └── lib/
-│       ├── supabase/                    # Client, server, middleware
-│       └── exportUtils.js               # PDF & calendar export
-├── supabase/
-│   └── migrations/
-│       ├── 001_initial_schema.sql       # Full database schema + RLS
-│       ├── 002_enable_realtime.sql      # Realtime + collaborator policies
-│       └── 003_fix_rls_recursion.sql    # Security definer functions
-└── .env.local                           # API keys (not committed)
-```
+| File | Why it exists |
+|---|---|
+| [`lib/itineraryPrompt.js`](src/lib/itineraryPrompt.js) | One realism ruleset shared by generate + replan, so they can't drift |
+| [`lib/groq.js`](src/lib/groq.js) | Key rotation. Rotates on rate limits only — a 400 fails fast rather than burning every key |
+| [`lib/settlement.js`](src/lib/settlement.js) | Balance netting + greedy min-transfer settlement |
+| [`lib/conflictChecker.js`](src/lib/conflictChecker.js) | Deterministic itinerary validation, no AI |
+| [`lib/replanTrip.js`](src/lib/replanTrip.js) | Whole-trip rebuild with the no-drop guarantees |
+| [`lib/withTimeout.js`](src/lib/withTimeout.js) | supabase-js queues behind token refresh; without a deadline a stalled refresh hangs the UI forever |
 
 ---
 
-## 🚀 Getting Started
+## 🚀 Setup
 
-### Prerequisites
-- **Node.js** 18+
-- **Supabase** account (free tier)
-- **Groq** API key (free tier)
-- **OpenRouteService** API key (free tier)
-
-### 1. Clone the repository
+### 1. Install
 
 ```bash
-git clone https://github.com/gowdavidwan2003/WanderForge.git
-cd WanderForge
 npm install
 ```
 
-### 2. Set up environment variables
+### 2. Environment
 
-Create a `.env.local` file in the root:
+Create `.env.local`:
 
-```env
+```bash
 # Supabase
-NEXT_PUBLIC_SUPABASE_URL=your_supabase_url
-NEXT_PUBLIC_SUPABASE_ANON_KEY=your_supabase_anon_key
-SUPABASE_SERVICE_ROLE_KEY=your_service_role_key
+NEXT_PUBLIC_SUPABASE_URL=https://<project>.supabase.co
+NEXT_PUBLIC_SUPABASE_ANON_KEY=<anon key>
+SUPABASE_SERVICE_ROLE_KEY=<service role key>
 
-# AI
-GROQ_API_KEY=your_groq_api_key
+# Groq — tried in order, rotates on rate limit
+GROQ_API_KEY=<key 1>
+GROQ_API_KEY_2=<key 2>   # optional
+GROQ_API_KEY_3=<key 3>   # optional
 
-# Maps & Routing
-NEXT_PUBLIC_ORS_API_KEY=your_openrouteservice_key
-OPENROUTESERVICE_API_KEY=your_openrouteservice_key
+# Google Maps — server-side only, never NEXT_PUBLIC_
+GOOGLE_MAPS_API_KEY=<key>   # needs Routes API + Places API (New)
+
+# OpenRouteService — routing fallback
+OPENROUTESERVICE_API_KEY=<key>
+
+NEXT_PUBLIC_APP_URL=http://localhost:3000
 ```
 
-### 3. Set up the database
+> 🔐 `GOOGLE_MAPS_API_KEY` and all Groq keys are **secret** and must stay server-side.
+> Restrict the Maps key to the Routes and Places APIs, by IP.
 
-Run the SQL migrations in order in the **Supabase SQL Editor**:
+### 3. Migrations
 
-1. `supabase/migrations/001_initial_schema.sql` — Tables, triggers, RLS
-2. `supabase/migrations/002_enable_realtime.sql` — Realtime channels
-3. `supabase/migrations/003_fix_rls_recursion.sql` — Security definer functions
+Run in order in the Supabase SQL editor:
 
-### 4. Run the development server
+| # | File | Adds |
+|---|---|---|
+| 001 | `001_initial_schema.sql` | Tables, RLS, storage |
+| 002 | `002_enable_realtime.sql` | Realtime, destination coords |
+| 003 | `003_fix_rls_recursion.sql` | `SECURITY DEFINER` helpers fixing policy recursion |
+| 004 | `004_collaboration_invites.sql` | Invite → accept, `get_my_invitations()` |
+| 005 | `005_expenses_and_currency.sql` | Expenses, equal/exact/percent splits, trip members |
+| 006 | `006_itinerary_lock.sql` | Itinerary lock + owner-only guard trigger |
+
+### 4. Run
 
 ```bash
 npm run dev
 ```
 
-Open [http://localhost:3000](http://localhost:3000) 🎉
+---
+
+## 📊 Production Readiness
+
+**Score: 4/10.** Honest assessment — the happy path works well; operational hardening does not exist yet.
+
+### 🔴 Hard blockers
+
+1. **Every cost-bearing API route is public.** `ai/generate`, `ai/chat`, `ai/replan-day`, `ai/replan-trip`, `geocode`, `places` and `route-matrix` have no auth check — an unauthenticated `POST /api/ai/generate` returns 200. Anyone with the URL can drain your Groq quota and run up Maps charges. Needs session checks **and** per-user rate limiting.
+2. **No email delivery.** Supabase's built-in mailer only reaches your own org members, so external users cannot complete signup. `resend` is installed but unwired.
+3. **Free/demo tiers throughout.** Groq free tier is 100k tokens/day; Google demo keys are explicitly not for production.
+4. **No tests.** No test script, no CI.
+
+### 🟠 Before real users
+
+- `profiles` uses `FOR SELECT USING (true)` — any holder of the anon key can read every user's email
+- No FX conversion; mixed-currency totals add raw numbers
+- No error monitoring
+- Migrations are applied by hand, so environments drift silently
+- Two pre-existing lint errors (`Navbar.jsx`, `ThemeProvider.jsx` — setState in effect)
+- Realtime sync, invite→accept, bookings and the lock are built and unit-tested but **not verified across two live browsers**
+
+### 🟢 Already solid
+
+- RLS on every table: collaborator gating, accepted-invite enforcement, DB-level lock
+- Collaborator invite endpoint requires trip ownership (was previously exploitable)
+- Destructive operations guarded — nothing deletes before a valid plan exists; day-range and merge validation are unit-tested
+- Groq key rotation with correct fallback semantics
+- AI output grounded in real road distances
+
+**Roughly a week of focused work to reach a defensible launch.**
 
 ---
 
-## 📊 Database Schema
+## 🗺️ Roadmap
 
-```mermaid
-erDiagram
-    profiles ||--o{ trips : creates
-    trips ||--o{ trip_days : has
-    trip_days ||--o{ activities : contains
-    trips ||--o{ trip_collaborators : shared_with
-    profiles ||--o{ trip_collaborators : collaborates
-    profiles ||--o{ user_api_keys : stores
-    trips ||--o{ reviews : receives
-
-    profiles {
-        uuid id PK
-        text display_name
-        text email
-        text avatar_url
-    }
-
-    trips {
-        uuid id PK
-        uuid user_id FK
-        text title
-        text destination
-        date start_date
-        date end_date
-        text transport_mode
-        decimal total_budget
-        text currency
-        jsonb ai_preferences
-    }
-
-    trip_days {
-        uuid id PK
-        uuid trip_id FK
-        int day_number
-        date date
-    }
-
-    activities {
-        uuid id PK
-        uuid trip_day_id FK
-        text title
-        text category
-        text location_name
-        float latitude
-        float longitude
-        time start_time
-        time end_time
-        decimal cost
-    }
-```
+- Re-enable the **itinerary conflict checker** (built, currently behind a "coming soon" panel)
+- Auth + rate limiting on all API routes
+- Resend SMTP for real invitations and verification
+- Offline mode (`idb` is installed, unused)
+- Drag-and-drop reordering (`@dnd-kit` installed, unused)
+- Budget analytics charts (`chart.js` installed, unused)
+- Photo uploads (`activity_photos` table and storage bucket exist, unused)
+- Post-trip journal and ratings (columns exist, unused)
 
 ---
 
-## 🗺️ Pages & Routes
+## 📄 License
 
-| Route | Auth | Description |
-|---|---|---|
-| `/` | ❌ | Landing page with hero, features, CTA |
-| `/auth/login` | ❌ | Email/password login |
-| `/auth/signup` | ❌ | Signup with OTP email verification |
-| `/dashboard` | ✅ | Trip cards, statistics, quick actions |
-| `/explore` | ❌ | 30 curated destination templates |
-| `/trip/new` | ✅ | 4-step trip creation wizard |
-| `/trip/[id]` | ✅ | Full trip editor with map & AI |
-| `/profile/[id]` | ✅ | User profile with BYOK key management |
-
----
-
-## 🔒 Security
-
-- **Row Level Security (RLS)** on all tables
-- **Security Definer functions** to prevent RLS recursion
-- **API keys** stored in `.env.local` (never committed)
-- **Server-side proxies** for all external API calls
-- **BYOK encryption** — user keys stored securely in Supabase
-
----
-
-## 🤝 Contributing
-
-1. Fork the repository
-2. Create a feature branch (`git checkout -b feature/amazing-feature`)
-3. Commit your changes (`git commit -m 'feat: add amazing feature'`)
-4. Push to the branch (`git push origin feature/amazing-feature`)
-5. Open a Pull Request
-
----
-
-## 📝 License
-
-This project is licensed under the MIT License.
-
----
-
-## 🙏 Acknowledgments
-
-- [Next.js](https://nextjs.org/) — The React framework
-- [Supabase](https://supabase.com/) — Open source Firebase alternative
-- [Groq](https://groq.com/) — Ultra-fast AI inference
-- [Leaflet](https://leafletjs.com/) — Open source interactive maps
-- [OpenRouteService](https://openrouteservice.org/) — Routing & directions
-- [Open-Meteo](https://open-meteo.com/) — Free weather API
-- [jsPDF](https://github.com/parallax/jsPDF) — PDF generation
-
----
-
-<p align="center">
-  Made with ❤️ by <a href="https://github.com/gowdavidwan2003">Vidwan Gowda H M</a>
-</p>
+MIT

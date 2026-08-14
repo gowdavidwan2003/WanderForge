@@ -2,6 +2,8 @@
 
 import { useState, useRef, useEffect } from 'react';
 import Button from '@/components/ui/Button';
+import { getSupabaseBrowserClient } from '@/lib/supabase/client';
+import { replanDay } from '@/lib/replanDay';
 
 const QUICK_PROMPTS = [
   '🍜 Best local food spots?',
@@ -12,7 +14,7 @@ const QUICK_PROMPTS = [
   '🕐 Optimize my schedule',
 ];
 
-export default function AIChatPanel({ trip, days, activities, isOpen, onClose }) {
+export default function AIChatPanel({ trip, days, activities, isOpen, onClose, onApplied }) {
   const [messages, setMessages] = useState([
     {
       role: 'assistant',
@@ -21,6 +23,8 @@ export default function AIChatPanel({ trip, days, activities, isOpen, onClose })
   ]);
   const [input, setInput] = useState('');
   const [loading, setLoading] = useState(false);
+  const [applying, setApplying] = useState(null);
+  const supabase = getSupabaseBrowserClient();
   const chatEndRef = useRef(null);
   const inputRef = useRef(null);
 
@@ -58,8 +62,22 @@ export default function AIChatPanel({ trip, days, activities, isOpen, onClose })
             days: days?.length,
             transportMode: trip?.transport_mode,
             budgetLevel: trip?.ai_preferences?.budget_level,
+            currency: trip?.currency,
             activityCount: allActivities.length,
           },
+          // The assistant needs the real schedule to slot new activities in
+          // without clashing with what is already planned.
+          itinerary: (days || []).map((d) => ({
+            day: d.day_number,
+            date: d.date,
+            activities: (activities?.[d.id] || []).map((a) => ({
+              title: a.title,
+              category: a.category,
+              location_name: a.location_name,
+              start_time: a.start_time,
+              end_time: a.end_time,
+            })),
+          })),
         }),
       });
 
@@ -68,7 +86,12 @@ export default function AIChatPanel({ trip, days, activities, isOpen, onClose })
 
       setMessages((prev) => [
         ...prev,
-        { role: 'assistant', content: data.reply || 'Sorry, I couldn\'t generate a response.' },
+        {
+          role: 'assistant',
+          content: data.reply || 'Sorry, I couldn\'t generate a response.',
+          actions: data.actions || null,
+          applied: false,
+        },
       ]);
     } catch (err) {
       setMessages((prev) => [
@@ -77,6 +100,94 @@ export default function AIChatPanel({ trip, days, activities, isOpen, onClose })
       ]);
     } finally {
       setLoading(false);
+    }
+  };
+
+  /**
+   * Apply the assistant's proposed edits to the database. This runs with the
+   * user's own Supabase client, so RLS decides what is actually permitted — a
+   * viewer cannot have the assistant edit a trip on their behalf.
+   */
+  const applyActions = async (messageIndex, actions) => {
+    if (trip?.itinerary_locked) {
+      setMessages((prev) => prev.map((m, i) => i === messageIndex
+        ? { ...m, applyError: 'This itinerary is locked. Ask the trip owner to unlock it.' } : m));
+      return;
+    }
+    setApplying(messageIndex);
+    let added = 0;
+    let removed = 0;
+    const replanned = [];
+    const failures = [];
+
+    try {
+      for (const title of actions.remove || []) {
+        const match = allActivities.find(
+          (a) => a.title?.toLowerCase() === String(title).toLowerCase()
+        );
+        if (!match) { failures.push(`Couldn't find "${title}" to remove`); continue; }
+
+        const { data, error } = await supabase
+          .from('activities').delete().eq('id', match.id).select();
+        if (error || !data?.length) failures.push(`Couldn't remove "${title}"`);
+        else removed++;
+      }
+
+      // Group the requested places by day, then re-plan each affected day as a
+      // whole. Inserting an activity on its own cannot account for travel time or
+      // what is already booked, which is how new places landed at clashing times.
+      const byDay = new Map();
+      for (const item of actions.add || []) {
+        const day = days?.find((d) => d.day_number === Number(item.day)) || days?.[0];
+        if (!day) { failures.push(`No day ${item.day} on this trip`); continue; }
+        if (!byDay.has(day.id)) byDay.set(day.id, { day, items: [] });
+        byDay.get(day.id).items.push(item);
+      }
+
+      for (const { day, items } of byDay.values()) {
+        const result = await replanDay(supabase, {
+          trip,
+          day,
+          keep: activities?.[day.id] || [],
+          mustInclude: items,
+        });
+
+        if (!result.ok) {
+          failures.push(`Couldn't replan Day ${day.day_number}: ${result.error}`);
+          continue;
+        }
+
+        replanned.push(day.day_number);
+        added += items.length;
+        failures.push(...(result.failures || []));
+        if (result.missing?.length) {
+          failures.push(`Day ${day.day_number} didn't include: ${result.missing.join(', ')}`);
+        }
+      }
+
+      const parts = [];
+      if (added) parts.push(`added ${added} place${added === 1 ? '' : 's'}`);
+      if (removed) parts.push(`removed ${removed}`);
+      if (replanned.length) {
+        parts.push(`replanned Day ${replanned.sort((a, b) => a - b).join(' and Day ')} around the change`);
+      }
+
+      setMessages((prev) =>
+        prev.map((m, i) => (i === messageIndex ? { ...m, applied: true } : m))
+      );
+      setMessages((prev) => [
+        ...prev,
+        {
+          role: 'assistant',
+          content: parts.length
+            ? `✅ Done — ${parts.join(' and ')}. Your itinerary is updated.${failures.length ? `\n\n⚠️ ${failures.join('\n')}` : ''}`
+            : `❌ Nothing was changed.\n\n${failures.join('\n')}`,
+        },
+      ]);
+
+      onApplied?.();
+    } finally {
+      setApplying(null);
     }
   };
 
@@ -119,6 +230,51 @@ export default function AIChatPanel({ trip, days, activities, isOpen, onClose })
                 {msg.content.split('\n').map((line, j) => (
                   <p key={j}>{line.replace(/\*\*(.*?)\*\*/g, '$1')}</p>
                 ))}
+
+                {/* Proposed edits are previewed and applied explicitly, so the
+                    assistant can never silently rewrite the itinerary. */}
+                {msg.actions && (
+                  <div className="proposal">
+                    <span className="proposal__title">Proposed changes</span>
+                    <span className="proposal__hint">Applying re-plans the affected day so everything still fits.</span>
+
+                    {(msg.actions.add || []).map((a, k) => (
+                      <div key={`a${k}`} className="proposal__row">
+                        <span className="proposal__op proposal__op--add">+</span>
+                        <span>
+                          <strong>{a.title}</strong>
+                          <span className="proposal__meta">
+                            {` Day ${a.day} · ${a.start_time}–${a.end_time} · ${a.location_name}`}
+                          </span>
+                        </span>
+                      </div>
+                    ))}
+
+                    {(msg.actions.remove || []).map((t, k) => (
+                      <div key={`r${k}`} className="proposal__row">
+                        <span className="proposal__op proposal__op--del">−</span>
+                        <span><strong>{t}</strong></span>
+                      </div>
+                    ))}
+
+                    {msg.applied ? (
+                      <span className="proposal__done">✅ Applied to your itinerary</span>
+                    ) : (
+                      <Button
+                        variant="primary"
+                        size="sm"
+                        loading={applying === i}
+                        disabled={applying !== null}
+                        onClick={() => applyActions(i, msg.actions)}
+                      >
+                        Apply to itinerary
+                      </Button>
+                    )}
+                    {m.applyError && (
+                      <span className="proposal__error">🔒 {m.applyError}</span>
+                    )}
+                  </div>
+                )}
               </div>
             </div>
           ))}
@@ -259,6 +415,33 @@ export default function AIChatPanel({ trip, days, activities, isOpen, onClose })
           flex-direction: column;
           gap: var(--space-3);
         }
+
+        .proposal {
+          margin-top: 10px; padding: 10px;
+          border: 1px solid var(--color-primary);
+          border-radius: var(--radius-md);
+          background: rgba(var(--color-primary-rgb), 0.08);
+          display: flex; flex-direction: column; gap: 6px; align-items: flex-start;
+        }
+        .proposal__title {
+          font-size: var(--text-xs); font-weight: 700;
+          text-transform: uppercase; letter-spacing: 0.05em;
+          color: var(--color-text-tertiary);
+        }
+        .proposal__row {
+          display: flex; gap: 8px; align-items: flex-start;
+          font-size: var(--text-sm); line-height: 1.35;
+        }
+        .proposal__op { font-weight: 700; flex-shrink: 0; }
+        .proposal__op--add { color: var(--color-success); }
+        .proposal__op--del { color: var(--color-error); }
+        .proposal__meta { color: var(--color-text-tertiary); font-size: var(--text-xs); display: block; }
+        .proposal__error {
+          display: block; margin-top: var(--space-2);
+          font-size: var(--text-xs); color: var(--color-error); font-weight: 600;
+        }
+        .proposal__hint { font-size: var(--text-xs); color: var(--color-text-tertiary); }
+        .proposal__done { font-size: var(--text-sm); color: var(--color-success); font-weight: 600; }
 
         .chat-msg {
           display: flex;
