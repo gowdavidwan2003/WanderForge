@@ -1,7 +1,6 @@
 'use client';
 
 import { useState } from 'react';
-import { useRouter } from 'next/navigation';
 import Link from 'next/link';
 import { useAuth } from '@/context/AuthProvider';
 import { useToast } from '@/components/ui/Toast';
@@ -9,17 +8,18 @@ import Button from '@/components/ui/Button';
 import Input from '@/components/ui/Input';
 
 export default function SignupPage() {
-  const [step, setStep] = useState(1); // 1: form, 2: OTP
+  // Confirmation happens by clicking the link in the email, which lands on
+  // /auth/callback and establishes the session there. Nothing further is
+  // entered on this page, so it only ever shows the form or the sent notice.
+  const [sent, setSent] = useState(false);
   const [name, setName] = useState('');
   const [email, setEmail] = useState('');
   const [password, setPassword] = useState('');
   const [confirmPassword, setConfirmPassword] = useState('');
-  const [otp, setOtp] = useState('');
   const [loading, setLoading] = useState(false);
   const [errors, setErrors] = useState({});
-  const { signUp, verifyOtp } = useAuth();
+  const { signUp } = useAuth();
   const toast = useToast();
-  const router = useRouter();
 
   const validate = () => {
     const errs = {};
@@ -48,27 +48,8 @@ export default function SignupPage() {
       }
       toast.error(error.message, 'Signup Failed');
     } else {
-      toast.success('Check your email for the verification code!', 'Almost There!');
-      setStep(2);
-    }
-  };
-
-  const handleVerifyOtp = async (e) => {
-    e.preventDefault();
-    if (!otp || otp.length < 6) {
-      setErrors({ otp: 'Enter the 6-digit code' });
-      return;
-    }
-
-    setLoading(true);
-    const { error } = await verifyOtp(email, otp);
-    setLoading(false);
-
-    if (error) {
-      toast.error(error.message, 'Verification Failed');
-    } else {
-      toast.success('Your account is ready!', 'Welcome to WanderForge! 🎉');
-      router.push('/dashboard');
+      toast.success('Check your email for the confirmation link!', 'Almost There!');
+      setSent(true);
     }
   };
 
@@ -81,7 +62,7 @@ export default function SignupPage() {
         </div>
 
         <div className="auth-card glass animate-scale-in">
-          {step === 1 ? (
+          {!sent ? (
             <>
               <div className="auth-card__header">
                 <span className="auth-card__emoji">✨</span>
@@ -163,33 +144,24 @@ export default function SignupPage() {
             <>
               <div className="auth-card__header">
                 <span className="auth-card__emoji">📧</span>
-                <h1 className="auth-card__title">Verify Email</h1>
+                <h1 className="auth-card__title">Check Your Email</h1>
                 <p className="auth-card__subtitle">
-                  We sent a 6-digit code to <strong>{email}</strong>
+                  We sent a confirmation link to <strong>{email}</strong>. Click it
+                  to activate your account.
                 </p>
               </div>
 
-              <form onSubmit={handleVerifyOtp} className="auth-card__form">
-                <Input
-                  label="Verification Code"
-                  type="text"
-                  value={otp}
-                  onChange={(e) => setOtp(e.target.value.replace(/\D/g, '').slice(0, 6))}
-                  placeholder="000000"
-                  error={errors.otp}
-                  required
-                  maxLength={6}
-                  style={{ textAlign: 'center', letterSpacing: '0.5em', fontSize: 'var(--text-2xl)' }}
-                />
+              <div className="auth-card__note">
+                <p>
+                  Open the link in <strong>this browser</strong> — it finishes signing
+                  you in here, and will not work from another device.
+                </p>
+                <p>Nothing after a minute? Check your spam folder.</p>
+              </div>
 
-                <Button type="submit" variant="primary" fullWidth loading={loading} size="lg">
-                  Verify & Continue
-                </Button>
-
-                <Button variant="ghost" fullWidth onClick={() => setStep(1)}>
-                  ← Back to signup
-                </Button>
-              </form>
+              <Button variant="ghost" fullWidth onClick={() => setSent(false)}>
+                ← Use a different email
+              </Button>
             </>
           )}
 
@@ -282,6 +254,27 @@ export default function SignupPage() {
           display: flex;
           flex-direction: column;
           gap: var(--space-5);
+        }
+
+        .auth-card__note {
+          display: flex;
+          flex-direction: column;
+          gap: var(--space-3);
+          padding: var(--space-4);
+          margin-bottom: var(--space-5);
+          border: 1px solid var(--color-border-light);
+          border-radius: var(--radius-lg);
+          background: var(--color-surface-raised, transparent);
+        }
+
+        .auth-card__note p {
+          font-size: var(--text-sm);
+          line-height: 1.6;
+          color: var(--color-text-tertiary);
+        }
+
+        .auth-card__note strong {
+          color: var(--color-text-secondary);
         }
 
         .auth-card__footer {
