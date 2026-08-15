@@ -3,6 +3,7 @@
 import { createContext, useContext, useEffect, useState, useRef } from 'react';
 import { getSupabaseBrowserClient } from '@/lib/supabase/client';
 import { withTimeout } from '@/lib/withTimeout';
+import { getAuthCallbackUrl } from '@/lib/siteUrl';
 
 const AuthContext = createContext(undefined);
 
@@ -100,7 +101,7 @@ export function AuthProvider({ children }) {
       password,
       options: {
         data: { display_name: displayName },
-        emailRedirectTo: `${window.location.origin}/auth/callback`,
+        emailRedirectTo: getAuthCallbackUrl(),
       },
     });
 
@@ -129,15 +130,6 @@ export function AuthProvider({ children }) {
     return { data, error };
   };
 
-  const verifyOtp = async (email, token) => {
-    const { data, error } = await supabase.auth.verifyOtp({
-      email,
-      token,
-      type: 'signup',
-    });
-    return { data, error };
-  };
-
   const signOut = async () => {
     await supabase.auth.signOut();
     setUser(null);
@@ -150,7 +142,6 @@ export function AuthProvider({ children }) {
     loading,
     signUp,
     signIn,
-    verifyOtp,
     signOut,
     refreshProfile: () => user && fetchProfile(user.id),
   };
@@ -168,7 +159,6 @@ export function useAuth() {
       loading: true,
       signUp: async () => ({ data: null, error: null }),
       signIn: async () => ({ data: null, error: null }),
-      verifyOtp: async () => ({ data: null, error: null }),
       signOut: async () => {},
       refreshProfile: () => {},
     };

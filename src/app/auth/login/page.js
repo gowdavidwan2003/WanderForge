@@ -1,6 +1,6 @@
 'use client';
 
-import { useState, Suspense } from 'react';
+import { useState, useEffect, useRef, Suspense } from 'react';
 import { useRouter, useSearchParams } from 'next/navigation';
 import Link from 'next/link';
 import { useAuth } from '@/context/AuthProvider';
@@ -26,6 +26,20 @@ function LoginForm() {
   const router = useRouter();
   const searchParams = useSearchParams();
   const redirect = searchParams.get('redirect') || '/dashboard';
+  const callbackError = searchParams.get('error');
+
+  // A confirmation link that has expired, been used already, or was opened in a
+  // different browser lands here. Without this the user arrives at a bare login
+  // form with no idea why their link did not work.
+  const warned = useRef(false);
+  useEffect(() => {
+    if (callbackError !== 'auth_callback_error' || warned.current) return;
+    warned.current = true;
+    toast.error(
+      'That confirmation link did not work. It may have expired, been used already, or been opened in a different browser. Log in below, or sign up again to get a fresh link.',
+      'Link Not Valid'
+    );
+  }, [callbackError, toast]);
 
   const validate = () => {
     const errs = {};
