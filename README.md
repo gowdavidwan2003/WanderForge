@@ -166,38 +166,6 @@ npm run dev
 
 ---
 
-## 📊 Production Readiness
-
-**Score: 4/10.** Honest assessment — the happy path works well; operational hardening does not exist yet.
-
-### 🔴 Hard blockers
-
-1. **Every cost-bearing API route is public.** `ai/generate`, `ai/chat`, `ai/replan-day`, `ai/replan-trip`, `geocode`, `places` and `route-matrix` have no auth check — an unauthenticated `POST /api/ai/generate` returns 200. Anyone with the URL can drain your Groq quota and run up Maps charges. Needs session checks **and** per-user rate limiting.
-2. **No email delivery.** Supabase's built-in mailer only reaches your own org members, so external users cannot complete signup. `resend` is installed but unwired.
-3. **Free/demo tiers throughout.** Groq free tier is 100k tokens/day; Google demo keys are explicitly not for production.
-4. **No tests.** No test script, no CI.
-
-### 🟠 Before real users
-
-- `profiles` uses `FOR SELECT USING (true)` — any holder of the anon key can read every user's email
-- No FX conversion; mixed-currency totals add raw numbers
-- No error monitoring
-- Migrations are applied by hand, so environments drift silently
-- Two pre-existing lint errors (`Navbar.jsx`, `ThemeProvider.jsx` — setState in effect)
-- Realtime sync, invite→accept, bookings and the lock are built and unit-tested but **not verified across two live browsers**
-
-### 🟢 Already solid
-
-- RLS on every table: collaborator gating, accepted-invite enforcement, DB-level lock
-- Collaborator invite endpoint requires trip ownership (was previously exploitable)
-- Destructive operations guarded — nothing deletes before a valid plan exists; day-range and merge validation are unit-tested
-- Groq key rotation with correct fallback semantics
-- AI output grounded in real road distances
-
-**Roughly a week of focused work to reach a defensible launch.**
-
----
-
 ## 🗺️ Roadmap
 
 - Re-enable the **itinerary conflict checker** (built, currently behind a "coming soon" panel)
