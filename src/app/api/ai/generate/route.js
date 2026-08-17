@@ -3,6 +3,7 @@ import { groqChatCompletion } from '@/lib/groq';
 import { REALISM_RULES, TRANSPORT_INFO, BUDGET_INFO } from '@/lib/itineraryPrompt';
 import { requireUser } from '@/lib/api/requireUser';
 import { clampRequestedDays } from '@/lib/tripLimits';
+import { PLANNING_MODEL, PLANNING_REASONING_EFFORT, planningMaxTokens } from '@/lib/groqModels';
 
 // Groq can sit on a connection well past a serverless default. Declaring the
 // ceiling makes the timeout ours to control rather than the platform's, and
@@ -75,7 +76,7 @@ RESPOND IN THIS EXACT JSON FORMAT (no other text, just JSON):
 }`;
 
     const result = await groqChatCompletion({
-        model: 'llama-3.3-70b-versatile',
+        model: PLANNING_MODEL,
         messages: [
           { role: 'system', content: systemPrompt },
           { role: 'user', content: userPrompt },
@@ -86,6 +87,8 @@ RESPOND IN THIS EXACT JSON FORMAT (no other text, just JSON):
         // which was causing spurious rate-limit errors on back-to-back requests.
         temperature: 0.4,
         response_format: { type: 'json_object' },
+        reasoning_effort: PLANNING_REASONING_EFFORT,
+        max_completion_tokens: planningMaxTokens(days),
     }, { userApiKey });
 
     if (!result.ok) {

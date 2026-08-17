@@ -27,6 +27,30 @@ export const ACTIVITY_CATEGORIES = [
   'nightlife', 'culture', 'nature', 'relaxation', 'other',
 ];
 
+/**
+ * Force a model-supplied category into the set the database accepts.
+ *
+ * activities.category carries a CHECK constraint listing exactly these values, so
+ * anything outside it — "food/drink", "sightseeing/culture", a capitalised
+ * "Food" — is rejected by Postgres and that activity is silently dropped from the
+ * itinerary. The prompt asks for one of the eleven, but a model improvises, and
+ * the replacement planning model does so more often than the retired one did: a
+ * five-day generation produced an out-of-enum value on the first try.
+ *
+ * Unknown values become 'other' rather than being discarded — the activity itself
+ * is still worth keeping.
+ */
+export function normalizeCategory(value) {
+  const raw = String(value ?? '').toLowerCase().trim();
+  if (ACTIVITY_CATEGORIES.includes(raw)) return raw;
+
+  // "food/drink", "food & drink", "Food - Dining" all start with a real category.
+  const first = raw.split(/[^a-z]+/).filter(Boolean)[0];
+  if (ACTIVITY_CATEGORIES.includes(first)) return first;
+
+  return 'other';
+}
+
 export const REALISM_RULES = `You are WanderForge AI, an expert travel planner. You create itineraries that a real traveler can actually follow, in this priority order:
 1. ACHIEVABLE - every single item is physically possible in the time given
 2. EXPERIENCE - within what is achievable, the most rewarding, authentic activities
