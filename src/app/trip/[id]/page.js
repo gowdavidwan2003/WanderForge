@@ -1,7 +1,7 @@
 'use client';
 
-import { useState, useEffect, useCallback, use } from 'react';
-import { useRouter } from 'next/navigation';
+import { useState, useEffect, useCallback, useRef, use } from 'react';
+import { notFound, useRouter } from 'next/navigation';
 import { useAuth } from '@/context/AuthProvider';
 import { useToast } from '@/components/ui/Toast';
 import { getSupabaseBrowserClient } from '@/lib/supabase/client';
@@ -40,6 +40,7 @@ const CATEGORY_CONFIG = {
 export default function TripEditorPage({ params }) {
   const { id } = use(params);
   const [trip, setTrip] = useState(null);
+  const [missing, setMissing] = useState(false);
   const [days, setDays] = useState([]);
   const [activities, setActivities] = useState({});
   const [selectedDay, setSelectedDay] = useState(null);
@@ -47,6 +48,10 @@ export default function TripEditorPage({ params }) {
   const [showActivityModal, setShowActivityModal] = useState(false);
   const [editingActivity, setEditingActivity] = useState(null);
   const [aiGenerating, setAiGenerating] = useState(false);
+  const [aiProgress, setAiProgress] = useState(null);
+  const [pendingGenerate, setPendingGenerate] = useState(null);
+  // Guards against a double-click landing before the aiGenerating state commits.
+  const generatingRef = useRef(false);
   const [weather, setWeather] = useState(null);
   const [selectedActivityId, setSelectedActivityId] = useState(null);
   const [collaborators, setCollaborators] = useState([]);
@@ -146,6 +151,16 @@ export default function TripEditorPage({ params }) {
         supabase.from('trips').select('*').eq('id', id).single(),
         'Loading this trip'
       );
+
+      // A trip that does not exist, or one RLS hides from this user, is a 404
+      // rather than a failure: .single() reports no rows as PGRST116. Record it
+      // and let the render throw notFound(), because notFound() called from this
+      // async callback would escape the error boundary entirely.
+      if (tripErr?.code === 'PGRST116' || (!tripErr && !tripData)) {
+        setMissing(true);
+        return;
+      }
+
       if (tripErr) throw tripErr;
       setTrip(tripData);
 
@@ -423,11 +438,94 @@ export default function TripEditorPage({ params }) {
   };
 
   // AI Generate itinerary
-  const handleAIGenerate = async () => {
-    if (blockedByLock()) return;
-    if (!trip) return;
+  /** Write one generated day's activities, returning how many landed. */
+  const insertDayPlan = async (day, dayPlan, currency, orderOffset = 0) => {
+    const acts = dayPlan?.activities || [];
+    let written = 0;
+
+    for (let i = 0; i < acts.length; i++) {
+      const act = acts[i];
+      let lat = null, lng = null;
+      if (act.location_name) {
+        // location_name usually already carries the town; appending the
+        // destination again produced queries no geocoder could match.
+        const geo = await geocodeLocation(
+          act.location_name,
+          trip.dest_lat != null ? { lat: trip.dest_lat, lng: trip.dest_lng } : null
+        );
+        if (geo) { lat = geo.lat; lng = geo.lng; }
+      }
+
+      const { error } = await supabase.from('activities').insert({
+        trip_day_id: day.id,
+        title: act.title,
+        description: act.description || '',
+        location_name: act.location_name || '',
+        category: act.category || 'sightseeing',
+        start_time: act.start_time || null,
+        end_time: act.end_time || null,
+        cost: parseFloat(act.cost) || 0,
+        notes: act.notes || '',
+        booking_link: act.booking_link || '',
+        order_index: orderOffset + i,
+        currency: currency || trip.currency || 'USD',
+        latitude: lat,
+        longitude: lng,
+      });
+
+      if (!error) written++;
+      setAiProgress((p) => (p ? { ...p, done: p.done + 1 } : p));
+    }
+
+    return written;
+  };
+
+  /** Adopt the AI's local currency and backfill destination coords for weather. */
+  const applyTripMetadata = async (data) => {
+    const detected = data.currency || inferCurrency(trip.destination);
+    if (detected && detected !== trip.currency) {
+      await supabase.from('trips').update({ currency: detected }).eq('id', trip.id);
+    }
+
+    if (!trip.dest_lat) {
+      const destGeo = await geocodeLocation(trip.destination);
+      if (destGeo) {
+        await supabase.from('trips').update({
+          dest_lat: destGeo.lat, dest_lng: destGeo.lng,
+        }).eq('id', trip.id);
+        fetchWeather(destGeo.lat, destGeo.lng);
+      }
+    }
+  };
+
+  /**
+   * Generate a whole itinerary.
+   *
+   * `mode` is 'replace' or 'append'. Generation used to insert unconditionally,
+   * so a second press — an obvious thing to try after a disappointing result, or
+   * after a long silent run that looks stuck — wrote a complete second copy of
+   * every activity with colliding order_index values, and the only way back was
+   * deleting them one at a time. handleAIGenerate now refuses to run blind and
+   * asks first; this does the work once a choice has been made.
+   */
+  const runGenerate = async (mode) => {
+    // A ref, not the aiGenerating state: state updates are asynchronous, so two
+    // clicks landing in the same tick could both pass a state-based check.
+    if (generatingRef.current) return;
+    generatingRef.current = true;
+    setPendingGenerate(null);
     setAiGenerating(true);
+    setAiProgress({ phase: 'planning', done: 0, total: 0 });
+
     try {
+      if (mode === 'replace') {
+        const dayIds = days.map((d) => d.id);
+        if (dayIds.length) {
+          const { error } = await supabase.from('activities').delete().in('trip_day_id', dayIds);
+          if (error) throw new Error(`Could not clear the old itinerary: ${error.message}`);
+        }
+      }
+
       const res = await fetch('/api/ai/generate', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
@@ -445,71 +543,104 @@ export default function TripEditorPage({ params }) {
       if (data.error) throw new Error(data.error);
       if (!data.itinerary) throw new Error('No itinerary returned');
 
-      // Insert generated activities into each day
+      const total = data.itinerary.reduce((s, d) => s + (d.activities?.length || 0), 0);
+      setAiProgress({ phase: 'saving', done: 0, total });
+
+      let written = 0;
       for (const dayPlan of data.itinerary) {
-        const dayNum = dayPlan.day;
-        const day = days.find(d => d.day_number === dayNum);
-        if (!day || !dayPlan.activities) continue;
-
-        for (let i = 0; i < dayPlan.activities.length; i++) {
-          const act = dayPlan.activities[i];
-          // Geocode each activity
-          let lat = null, lng = null;
-          if (act.location_name) {
-            // location_name usually already carries the town; appending the
-            // destination again produced queries no geocoder could match.
-            const geo = await geocodeLocation(
-              act.location_name,
-              trip.dest_lat != null ? { lat: trip.dest_lat, lng: trip.dest_lng } : null
-            );
-            if (geo) { lat = geo.lat; lng = geo.lng; }
-          }
-
-          await supabase.from('activities').insert({
-            trip_day_id: day.id,
-            title: act.title,
-            description: act.description || '',
-            location_name: act.location_name || '',
-            category: act.category || 'sightseeing',
-            start_time: act.start_time || null,
-            end_time: act.end_time || null,
-            cost: parseFloat(act.cost) || 0,
-            notes: act.notes || '',
-            booking_link: act.booking_link || '',
-            order_index: i,
-            currency: data.currency || trip.currency || 'USD',
-            latitude: lat,
-            longitude: lng,
-          });
-        }
+        const day = days.find((d) => d.day_number === dayPlan.day);
+        if (!day) continue;
+        // Appending must not reuse order_index values already on the day.
+        const offset = mode === 'append' ? (activities[day.id]?.length || 0) : 0;
+        written += await insertDayPlan(day, dayPlan, data.currency, offset);
       }
 
-      // The AI reports the destination's local currency. Adopt it so costs are no
-      // longer labelled with whatever the wizard dropdown happened to default to.
-      const detected = data.currency || inferCurrency(trip.destination);
-      if (detected && detected !== trip.currency) {
-        await supabase.from('trips').update({ currency: detected }).eq('id', trip.id);
-      }
+      await applyTripMetadata(data);
 
-      // Also geocode destination for weather
-      if (!trip.dest_lat) {
-        const destGeo = await geocodeLocation(trip.destination);
-        if (destGeo) {
-          await supabase.from('trips').update({
-            dest_lat: destGeo.lat, dest_lng: destGeo.lng
-          }).eq('id', trip.id);
-          fetchWeather(destGeo.lat, destGeo.lng);
-        }
-      }
-
-      toast.success(`${data.itinerary.length} days generated with ${data.itinerary.reduce((s, d) => s + (d.activities?.length || 0), 0)} activities!`, 'AI Itinerary Ready 🤖');
+      toast.success(
+        `${data.itinerary.length} days planned, ${written} activities saved.`,
+        mode === 'append' ? 'Added to your itinerary 🤖' : 'AI Itinerary Ready 🤖'
+      );
       fetchTripData();
     } catch (err) {
       toast.error(err.message, 'AI Generation Failed');
     } finally {
+      generatingRef.current = false;
       setAiGenerating(false);
+      setAiProgress(null);
     }
   };
+
+  const handleAIGenerate = () => {
+    if (blockedByLock() || !trip) return;
+    if (generatingRef.current) return;
+
+    const existing = Object.values(activities).flat().length;
+    if (existing > 0) {
+      setPendingGenerate({ existing });
+      return;
+    }
+
+    runGenerate('replace');
+  };
+
+  /**
+   * Fill just the selected day.
+   *
+   * This button used to call handleAIGenerate, so "AI Fill" on one empty day
+   * regenerated the entire trip. replanDay cannot be reused here — it rejects an
+   * empty day outright — so ask for a single day's plan instead, which also costs
+   * a fraction of the tokens of a full trip.
+   */
+  const handleAIFillDay = async () => {
+    if (blockedByLock() || !trip || !selectedDay) return;
+    if (generatingRef.current) return;
+    generatingRef.current = true;
+    setAiGenerating(true);
+    setAiProgress({ phase: 'planning', done: 0, total: 0 });
+
+    try {
+      const res = await fetch('/api/ai/generate', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          destination: trip.destination,
+          days: 1,
+          interests: trip.ai_preferences?.interests || [],
+          transportMode: trip.transport_mode,
+          budgetLevel: trip.ai_preferences?.budget_level || 'moderate',
+          notes: trip.ai_preferences?.notes || '',
+        }),
+      });
+
+      const data = await res.json();
+      if (data.error) throw new Error(data.error);
+
+      const dayPlan = data.itinerary?.[0];
+      if (!dayPlan?.activities?.length) throw new Error('The AI returned an empty day.');
+
+      setAiProgress({ phase: 'saving', done: 0, total: dayPlan.activities.length });
+      const offset = activities[selectedDay.id]?.length || 0;
+      const written = await insertDayPlan(selectedDay, dayPlan, data.currency, offset);
+      await applyTripMetadata(data);
+
+      toast.success(
+        `Day ${selectedDay.day_number} filled with ${written} activities.`,
+        dayPlan.theme || 'Day Planned 🤖'
+      );
+      fetchTripData();
+    } catch (err) {
+      toast.error(err.message, 'AI Fill Failed');
+    } finally {
+      generatingRef.current = false;
+      setAiGenerating(false);
+      setAiProgress(null);
+    }
+  };
+
+  // Thrown during render so the not-found boundary catches it. Calling
+  // notFound() from the fetch callback would not be caught at all.
+  if (missing) notFound();
 
   if (loading) {
     return (
@@ -610,7 +741,13 @@ export default function TripEditorPage({ params }) {
                 ].filter(Boolean)}
                 primaryAction={{
                   key: 'ai-generate',
-                  label: aiGenerating ? 'Generating...' : 'AI Generate',
+                  // A silent multi-minute run is what makes people click again,
+                  // so say which phase it is in and how far along.
+                  label: !aiGenerating
+                    ? 'AI Generate'
+                    : aiProgress?.phase === 'saving' && aiProgress.total
+                      ? `Saving ${aiProgress.done}/${aiProgress.total}`
+                      : 'Planning your trip...',
                   icon: '🤖',
                   onClick: handleAIGenerate,
                   loading: aiGenerating,
@@ -738,10 +875,18 @@ export default function TripEditorPage({ params }) {
                       <div className="main__empty">
                         <span>🗓️</span>
                         <h3>No activities yet</h3>
-                        <p>Click &quot;AI Generate&quot; to auto-fill, or add manually</p>
+                        <p>Fill just this day with AI, or add activities yourself</p>
                         <div style={{ display: 'flex', gap: '8px', justifyContent: 'center', marginTop: '12px' }}>
                           <Button variant="primary" size="sm" onClick={openAddActivity} disabled={isLocked}>+ Add Manually</Button>
-                          <Button variant="secondary" size="sm" onClick={handleAIGenerate} loading={aiGenerating}>🤖 AI Fill</Button>
+                          <Button
+                            variant="secondary"
+                            size="sm"
+                            onClick={handleAIFillDay}
+                            loading={aiGenerating}
+                            disabled={aiGenerating || isLocked}
+                          >
+                            🤖 Fill Day {selectedDay.day_number}
+                          </Button>
                         </div>
                       </div>
                     ) : (
@@ -847,6 +992,36 @@ export default function TripEditorPage({ params }) {
             <Button variant="ghost" onClick={() => setDeletingActivity(null)}>Cancel</Button>
             <Button variant="primary" onClick={confirmDeleteActivity}>Delete</Button>
           </div>
+        </div>
+      </Modal>
+
+      {/* Generation used to overwrite nothing and duplicate everything. Ask. */}
+      <Modal
+        isOpen={!!pendingGenerate}
+        onClose={() => setPendingGenerate(null)}
+        title="This trip already has an itinerary"
+      >
+        <div style={{ display: 'flex', flexDirection: 'column', gap: 'var(--space-5)' }}>
+          <p style={{ color: 'var(--color-text-secondary)', fontSize: 'var(--text-sm)', lineHeight: 1.6 }}>
+            There {pendingGenerate?.existing === 1 ? 'is' : 'are'} already{' '}
+            <strong style={{ color: 'var(--color-text)' }}>
+              {pendingGenerate?.existing} {pendingGenerate?.existing === 1 ? 'activity' : 'activities'}
+            </strong>{' '}
+            planned. Generating again can either start over or add alongside what
+            you have.
+          </p>
+          <div style={{ display: 'flex', flexWrap: 'wrap', justifyContent: 'flex-end', gap: 'var(--space-3)' }}>
+            <Button variant="ghost" onClick={() => setPendingGenerate(null)}>Cancel</Button>
+            <Button variant="secondary" onClick={() => runGenerate('append')}>
+              Add alongside
+            </Button>
+            <Button variant="primary" onClick={() => runGenerate('replace')}>
+              Replace everything
+            </Button>
+          </div>
+          <p style={{ color: 'var(--color-text-tertiary)', fontSize: 'var(--text-xs)' }}>
+            Replacing deletes the current activities and cannot be undone.
+          </p>
         </div>
       </Modal>
 
