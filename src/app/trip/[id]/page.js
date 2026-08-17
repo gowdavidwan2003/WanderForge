@@ -12,6 +12,7 @@ import Modal from '@/components/ui/Modal';
 import LoadingSpinner from '@/components/ui/LoadingSpinner';
 import DynamicMap from '@/components/maps/DynamicMap';
 import CollaborationPanel from '@/components/trip/CollaborationPanel';
+import TripActionBar from '@/components/trip/TripActionBar';
 import AIChatPanel from '@/components/trip/AIChatPanel';
 import { useRealtimeTrip } from '@/hooks/useRealtimeTrip';
 import ExpenseSplitPanel from '@/components/trip/ExpenseSplitPanel';
@@ -559,7 +560,63 @@ export default function TripEditorPage({ params }) {
                   <span>📋 {allActivities.length} activities</span>
                 </div>
               </div>
-              <div className="editor__header-actions">
+              <TripActionBar
+                actions={[
+                  isOwner && {
+                    key: 'lock',
+                    label: isLocked ? 'Unlock' : 'Lock',
+                    icon: isLocked ? '🔒' : '🔓',
+                    variant: isLocked ? 'primary' : 'ghost',
+                    onClick: handleToggleLock,
+                    loading: togglingLock,
+                    disabled: togglingLock,
+                    title: isLocked
+                      ? 'Unlock so the group can edit the itinerary again'
+                      : 'Freeze the itinerary so nobody can change it',
+                  },
+                  {
+                    key: 'nearby',
+                    label: 'Find Nearby',
+                    icon: '🧭',
+                    onClick: () => setShowNearby(true),
+                    disabled: isLocked,
+                  },
+                  {
+                    key: 'bookings',
+                    label: 'Bookings',
+                    icon: '🏨',
+                    onClick: () => setShowBookings(true),
+                  },
+                  {
+                    key: 'locate',
+                    label: locating ? `Locating ${locating.done}/${locating.total}` : 'Locate on Map',
+                    icon: '📍',
+                    onClick: handleLocateActivities,
+                    loading: !!locating,
+                    disabled: !!locating || isLocked,
+                  },
+                  {
+                    key: 'conflicts',
+                    label: 'Check Itinerary',
+                    icon: '🔍',
+                    onClick: () => setShowConflicts(true),
+                  },
+                  {
+                    key: 'expenses',
+                    label: 'Split Bills',
+                    icon: '🧾',
+                    onClick: () => setShowExpenses(true),
+                  },
+                ].filter(Boolean)}
+                primaryAction={{
+                  key: 'ai-generate',
+                  label: aiGenerating ? 'Generating...' : 'AI Generate',
+                  icon: '🤖',
+                  onClick: handleAIGenerate,
+                  loading: aiGenerating,
+                  disabled: aiGenerating || isLocked,
+                }}
+              >
                 <CollaborationPanel
                   tripId={id}
                   trip={trip}
@@ -570,75 +627,7 @@ export default function TripEditorPage({ params }) {
                   onlineUsers={onlineUsers}
                   onRefresh={() => { fetchCollaborators(); fetchTripData(); }}
                 />
-                {isOwner && (
-                  <Button
-                    variant={isLocked ? 'primary' : 'ghost'}
-                    size="sm"
-                    onClick={handleToggleLock}
-                    loading={togglingLock}
-                    disabled={togglingLock}
-                    icon={<span>{isLocked ? '🔒' : '🔓'}</span>}
-                    title={isLocked
-                      ? 'Unlock so the group can edit the itinerary again'
-                      : 'Freeze the itinerary so nobody can change it'}
-                  >
-                    {isLocked ? 'Unlock' : 'Lock'}
-                  </Button>
-                )}
-                <Button
-                  variant="ghost"
-                  size="sm"
-                  onClick={() => setShowNearby(true)}
-                  disabled={isLocked}
-                  icon={<span>🧭</span>}
-                >
-                  Find Nearby
-                </Button>
-                <Button
-                  variant="ghost"
-                  size="sm"
-                  onClick={() => setShowBookings(true)}
-                  icon={<span>🏨</span>}
-                >
-                  Bookings
-                </Button>
-                <Button
-                  variant="ghost"
-                  size="sm"
-                  onClick={handleLocateActivities}
-                  loading={!!locating}
-                  disabled={!!locating || isLocked}
-                  icon={<span>📍</span>}
-                >
-                  {locating ? `Locating ${locating.done}/${locating.total}` : 'Locate on Map'}
-                </Button>
-                <Button
-                  variant="ghost"
-                  size="sm"
-                  onClick={() => setShowConflicts(true)}
-                  icon={<span>🔍</span>}
-                >
-                  Check Itinerary
-                </Button>
-                <Button
-                  variant="ghost"
-                  size="sm"
-                  onClick={() => setShowExpenses(true)}
-                  icon={<span>🧾</span>}
-                >
-                  Split Bills
-                </Button>
-                <Button
-                  variant="primary"
-                  size="sm"
-                  onClick={handleAIGenerate}
-                  loading={aiGenerating}
-                  disabled={aiGenerating || isLocked}
-                  icon={<span>🤖</span>}
-                >
-                  {aiGenerating ? 'Generating...' : 'AI Generate'}
-                </Button>
-              </div>
+              </TripActionBar>
             </div>
           </div>
         </div>
@@ -950,7 +939,10 @@ export default function TripEditorPage({ params }) {
           flex-wrap: wrap;
         }
 
-        .editor__header-actions { display: flex; gap: var(--space-2); flex-shrink: 0; }
+        /* The action row lives in TripActionBar, which owns its own wrapping and
+           its below-768px overflow menu. The rule that used to be here set
+           flex-shrink: 0 with no flex-wrap, which pushed AI Generate off-screen
+           on phones. */
 
         .editor__back {
           background: none; border: none;
