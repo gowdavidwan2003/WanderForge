@@ -146,6 +146,27 @@ export async function groqChatCompletion(body, { userApiKey } = {}) {
 
     const payload = await res.json().catch(() => ({}));
 
+    // Checked before isRateLimited, which also matches this message and would
+    // otherwise rotate through every key and report generic exhaustion.
+    //
+    // 413 is a reservation rejection, not a malformed request: Groq counts
+    // prompt + max_completion_tokens against the organisation's tokens-per-minute
+    // allowance and refuses up front. Rotating does not help — the limit is per
+    // organisation, not per key — and Groq's own wording ("Request too large...
+    // please reduce your message size") points at the prompt, when the cause is
+    // the requested completion budget.
+    if (res.status === 413) {
+      console.warn(
+        `[WanderForge] Groq refused the token reservation on key ${maskKey(key)}: ${payload?.error?.message || '413'}`
+      );
+      return {
+        ok: false,
+        status: 429,
+        throttled: true,
+        error: 'The AI provider is at its per-minute token limit. Wait a moment and try again, or plan fewer days at once.',
+      };
+    }
+
     if (isRateLimited(res.status, payload)) {
       console.warn(
         `[WanderForge] Groq key ${maskKey(key)} rate-limited (${i + 1}/${keys.length}), trying next.`

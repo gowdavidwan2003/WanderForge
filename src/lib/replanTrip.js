@@ -1,3 +1,4 @@
+import { normalizeCategory } from '@/lib/itineraryPrompt';
 /**
  * Rebuild an entire trip, preserving every place already collected.
  *
@@ -148,7 +149,7 @@ export async function applyTripPlan(supabase, { trip, days, activities, plan }) 
         title: act.title,
         description: act.description || '',
         location_name: act.location_name || '',
-        category: act.category || 'other',
+        category: normalizeCategory(act.category),
         start_time: act.start_time || null,
         end_time: act.end_time || null,
         cost: Number(act.cost) || 0,
