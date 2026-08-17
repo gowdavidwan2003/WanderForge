@@ -123,7 +123,7 @@ RESPOND IN THIS EXACT JSON FORMAT (no other text, just JSON):
         temperature: 0.4,
         response_format: { type: 'json_object' },
         reasoning_effort: PLANNING_REASONING_EFFORT,
-        max_completion_tokens: planningMaxTokens(days.length),
+        max_completion_tokens: planningMaxTokens(days.length, REALISM_RULES + userPrompt),
     }, { userApiKey });
 
     if (!result.ok) {
@@ -215,7 +215,7 @@ ${
         temperature: 0.3,
         response_format: { type: 'json_object' },
         reasoning_effort: PLANNING_REASONING_EFFORT,
-        max_completion_tokens: planningMaxTokens(days.length),
+        max_completion_tokens: planningMaxTokens(days.length, REALISM_RULES + userPrompt),
       }, { userApiKey });
 
       if (repair.ok) {

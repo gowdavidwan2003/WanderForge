@@ -54,24 +54,28 @@ export const CHAT_MODEL = process.env.GROQ_CHAT_MODEL || 'openai/gpt-oss-20b';
  * has to reason its way to.
  */
 /**
- * Planning runs at 'low', because 'medium' does not fit this account's budget.
+ * Planning runs at 'low', because medium's cost is not predictable enough to
+ * budget for against an 8,000 tokens-per-minute ceiling.
  *
- * Medium is the more attractive setting on paper — these prompts carry the realism
- * constraints, and deliberation is exactly what they reward. It was tried and
- * measured, and it truncates:
+ * Medium was tried repeatedly. It works on short trips and fails on longer ones,
+ * and the deciding factor is that its reasoning spend varies by roughly 2x between
+ * runs of the same prompt:
  *
  *   effort   trip    reasoning   outcome
- *   medium   3-day        2,771   finish_reason "length", currency field missing
- *   medium   5-day        2,502   truncated at 6,800, needed ~11,000
- *   low      5-day           35   complete
+ *   medium   3-day       2,878    complete
+ *   medium   5-day       2,473    complete
+ *   medium   5-day       4,898    truncated — 3 days of 5, currency missing
+ *   low      3-day         458    complete
+ *   low      5-day          32    complete
  *
- * The reason is the tokens-per-minute ceiling below, not the model: reasoning
- * tokens come out of the same completion budget as the itinerary, so at medium
- * roughly half the available budget is spent before any JSON is written, and the
- * tail — currency, pro_tips, the last day — is what gets cut.
+ * Reasoning comes out of the same budget as the itinerary, so a run that thinks
+ * twice as hard as the last one silently loses the tail — the final days, the
+ * currency, the tips. Sizing for the worst case would leave too little content
+ * budget to be worth it. Low is not measurably worse here: the realism rules are
+ * stated in the prompt rather than something to be reasoned toward.
  *
- * Set GROQ_PLANNING_EFFORT=medium to revisit this on a paid tier, where a larger
- * TPM allowance makes the reservation affordable.
+ * GROQ_PLANNING_EFFORT=medium is worth revisiting on a paid tier, where the wider
+ * TPM allowance absorbs the variance.
  */
 export const PLANNING_REASONING_EFFORT = process.env.GROQ_PLANNING_EFFORT || 'low';
 
@@ -101,18 +105,35 @@ export const CHAT_REASONING_EFFORT = process.env.GROQ_CHAT_EFFORT || 'low';
  *   low                   35            3082    3117
  *   medium              2502            3538    6040
  *
- * Sized for 'low', the shipped effort: nearly the whole budget goes to the
- * itinerary. Reserving less than the cap where possible also matters, because the
- * reservation is charged against TPM whether or not it is used — a short trip that
- * asks for 6,200 tokens blocks the next request for no reason.
+ * The budget is derived from the prompt rather than fixed, because the limit
+ * applies to their sum. replan-trip's prompt carries every place on the trip plus
+ * the conflict list, so it can be several times the size of generate's — a single
+ * constant either wastes budget on short prompts or exceeds the limit on long
+ * ones, and exceeding it fails the request outright with a 413.
+ *
+ * Pass the prompt text so the ceiling is computed from what is actually being
+ * sent. The 4-chars-per-token estimate is deliberately rough and the margin
+ * covers it being wrong.
  */
-const CAP = 6200;              // keeps prompt + budget under the 8,000 TPM limit
-const REASONING_HEADROOM = 600; // 'low' measured at ~35 tokens; this is slack
+const TPM_LIMIT = 8000;
+const TPM_MARGIN = 500;        // absorbs the token estimate being off
+const MODEL_CAP = 8192;        // hard per-request ceiling on gpt-oss-120b
+const REASONING_HEADROOM = 900; // 'low' measured between 32 and 458 tokens
 
-export function planningMaxTokens(days) {
+export function planningMaxTokens(days, promptText = '') {
   const n = Number(days) || 1;
-  const content = 700 * n + 800;
-  return Math.min(Math.max(2500, Math.round(content + REASONING_HEADROOM)), CAP);
+
+  const promptTokens = Math.ceil(String(promptText).length / 4);
+  const affordable = TPM_LIMIT - promptTokens - TPM_MARGIN;
+
+  // ~1,100 tokens per day: a full day comes back as 8-12 entries once meals and
+  // both legs of every long transfer are included, at roughly 100-120 tokens each.
+  // The earlier 700 estimate was taken from days of 7-8 entries and undershot.
+  const wanted = 1100 * n + 800 + REASONING_HEADROOM;
+
+  // Floor of 1,500: below that even one day cannot complete, and it is better to
+  // attempt it and report truncation than to send a request guaranteed to fail.
+  return Math.max(1500, Math.min(wanted, affordable, MODEL_CAP));
 }
 
 /** Chat replies are short; the ceiling exists so reasoning cannot truncate one. */
