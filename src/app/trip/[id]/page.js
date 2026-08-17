@@ -13,6 +13,7 @@ import LoadingSpinner from '@/components/ui/LoadingSpinner';
 import DynamicMap from '@/components/maps/DynamicMap';
 import CollaborationPanel from '@/components/trip/CollaborationPanel';
 import TripActionBar from '@/components/trip/TripActionBar';
+import ConfirmGenerateModal from '@/components/trip/ConfirmGenerateModal';
 import AIChatPanel from '@/components/trip/AIChatPanel';
 import { useRealtimeTrip } from '@/hooks/useRealtimeTrip';
 import ExpenseSplitPanel from '@/components/trip/ExpenseSplitPanel';
@@ -1007,35 +1008,12 @@ export default function TripEditorPage({ params }) {
         </div>
       </Modal>
 
-      {/* Generation used to overwrite nothing and duplicate everything. Ask. */}
-      <Modal
-        isOpen={!!pendingGenerate}
-        onClose={() => setPendingGenerate(null)}
-        title="This trip already has an itinerary"
-      >
-        <div style={{ display: 'flex', flexDirection: 'column', gap: 'var(--space-5)' }}>
-          <p style={{ color: 'var(--color-text-secondary)', fontSize: 'var(--text-sm)', lineHeight: 1.6 }}>
-            There {pendingGenerate?.existing === 1 ? 'is' : 'are'} already{' '}
-            <strong style={{ color: 'var(--color-text)' }}>
-              {pendingGenerate?.existing} {pendingGenerate?.existing === 1 ? 'activity' : 'activities'}
-            </strong>{' '}
-            planned. Generating again can either start over or add alongside what
-            you have.
-          </p>
-          <div style={{ display: 'flex', flexWrap: 'wrap', justifyContent: 'flex-end', gap: 'var(--space-3)' }}>
-            <Button variant="ghost" onClick={() => setPendingGenerate(null)}>Cancel</Button>
-            <Button variant="secondary" onClick={() => runGenerate('append')}>
-              Add alongside
-            </Button>
-            <Button variant="primary" onClick={() => runGenerate('replace')}>
-              Replace everything
-            </Button>
-          </div>
-          <p style={{ color: 'var(--color-text-tertiary)', fontSize: 'var(--text-xs)' }}>
-            Replacing deletes the current activities and cannot be undone.
-          </p>
-        </div>
-      </Modal>
+      <ConfirmGenerateModal
+        pending={pendingGenerate}
+        onCancel={() => setPendingGenerate(null)}
+        onReplace={() => runGenerate('replace')}
+        onAppend={() => runGenerate('append')}
+      />
 
       <NearbyPlacesPanel
         trip={{ ...trip, currency: tripCurrency }}

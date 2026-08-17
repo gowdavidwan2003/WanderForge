@@ -24,8 +24,8 @@ BEGIN;
 DO $$
 DECLARE
   -- >>> EDIT THESE TWO <<<
-  v_owner  UUID := '00000000-0000-0000-0000-000000000001';
-  v_editor UUID := '00000000-0000-0000-0000-000000000002';
+  v_owner  UUID := '00d06b02-2a47-4447-a6fb-931ac387d2d6';
+  v_editor UUID := 'ecc505b3-eae8-4640-b98b-6a39adba3bcd';
 
   v_trip     UUID;
   v_collab   UUID;
