@@ -87,9 +87,12 @@ export function AuthProvider({ children }) {
   }, []);
 
   const fetchProfile = async (userId) => {
+    // Explicit columns, not '*': migration 007 revokes SELECT on profiles.email
+    // from client roles, and Postgres rejects SELECT * unless the role can read
+    // every column. The signed-in user's own address is on `user.email` anyway.
     const { data } = await supabase
       .from('profiles')
-      .select('*')
+      .select('id, display_name, avatar_url, bio, countries_visited, trips_count, badges, theme_preference, created_at, updated_at')
       .eq('id', userId)
       .single();
     setProfile(data);

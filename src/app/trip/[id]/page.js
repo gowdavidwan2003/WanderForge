@@ -124,16 +124,18 @@ export default function TripEditorPage({ params }) {
       return;
     }
 
+    // No email: migration 007 revokes SELECT on that column from client roles,
+    // because a world-readable email list is what let an attacker pick a victim
+    // to impersonate. display_name is always populated by handle_new_user.
     const { data: people } = await supabase
       .from('profiles')
-      .select('id, display_name, email')
+      .select('id, display_name')
       .in('id', rows.map(r => r.user_id));
 
     const byId = Object.fromEntries((people || []).map(p => [p.id, p]));
     setCollaborators(rows.map(c => ({
       ...c,
       display_name: byId[c.user_id]?.display_name,
-      email: byId[c.user_id]?.email,
     })));
   };
 
