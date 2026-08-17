@@ -20,28 +20,67 @@ const round = (n) => Math.round(n * 100) / 100;
  * An expense either carries explicit `shares` (an unequal split entered by the
  * user) or splits its amount equally across `participants`. Everything
  * downstream works off this, so equal and unequal splits share one code path.
+ *
+ * The returned shares always sum to the expense amount — every caller relies on
+ * that to keep the group's balances netting to zero. When explicit shares do not
+ * already sum correctly, the shortfall is resolved in this order:
+ *
+ *  1. Over-assigned (shares exceed the amount): scale down proportionally. The
+ *     group is never billed more in total than was actually spent, and the
+ *     relative split the user entered is preserved.
+ *  2. Under-assigned with participants left unnamed: those participants split
+ *     the remainder equally. Naming one person's portion of a bill says what
+ *     they owe, not that everyone else owes nothing.
+ *  3. Under-assigned with the payer unnamed: the payer absorbs the remainder.
+ *  4. Under-assigned with everyone already named: scale up proportionally. Here
+ *     the split really is stale relative to the amount — the case this guard was
+ *     originally written for — so keeping the entered ratio is the best guess.
+ *
+ * Only case 4 rescales an under-assigned split. Applying it to case 2 charged a
+ * partial share the entire bill: assigning 30 of a 100 expense to one friend
+ * billed them 100.
  */
 export function sharesFor(expense) {
   const amount = Number(expense?.amount) || 0;
   if (!amount) return {};
 
-  const explicit = expense.shares && typeof expense.shares === 'object' ? expense.shares : null;
+  const participants = (expense?.participants || []).filter(Boolean);
+  const explicit =
+    expense?.shares && typeof expense.shares === 'object' ? expense.shares : null;
+
   if (explicit) {
     const entries = Object.entries(explicit)
       .map(([id, v]) => [id, Number(v) || 0])
       .filter(([, v]) => v > 0);
 
     if (entries.length) {
-      // Guard against shares that don't sum to the total (rounding, or an amount
-      // edited after the split was set): scale them to match so balances stay
-      // consistent with what was actually spent.
+      const named = new Set(entries.map(([id]) => id));
       const sum = entries.reduce((s, [, v]) => s + v, 0);
-      const factor = Math.abs(sum - amount) > EPSILON && sum > 0 ? amount / sum : 1;
-      return Object.fromEntries(entries.map(([id, v]) => [id, v * factor]));
+      const scaled = () => Object.fromEntries(entries.map(([id, v]) => [id, (v * amount) / sum]));
+
+      // 1. Over-assigned.
+      if (sum - amount > EPSILON) return scaled();
+
+      const remainder = amount - sum;
+      if (remainder <= EPSILON) return Object.fromEntries(entries);
+
+      // 2. Participants who were not given a share cover what is left.
+      const unnamed = participants.filter((p) => !named.has(p));
+      if (unnamed.length) {
+        const each = remainder / unnamed.length;
+        return Object.fromEntries([...entries, ...unnamed.map((p) => [p, each])]);
+      }
+
+      // 3. Nobody left but the payer.
+      if (expense?.paid_by && !named.has(expense.paid_by)) {
+        return Object.fromEntries([...entries, [expense.paid_by, remainder]]);
+      }
+
+      // 4. Everyone is named and the total drifted.
+      return scaled();
     }
   }
 
-  const participants = (expense.participants || []).filter(Boolean);
   if (!participants.length) return {};
 
   const each = amount / participants.length;
