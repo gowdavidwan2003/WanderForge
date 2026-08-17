@@ -1,5 +1,6 @@
 import { NextResponse } from 'next/server';
 import { groqChatCompletion } from '@/lib/groq';
+import { requireUser } from '@/lib/api/requireUser';
 
 const CATEGORIES = [
   'sightseeing', 'food', 'transport', 'accommodation', 'adventure', 'shopping',
@@ -67,7 +68,17 @@ function describeItinerary(itinerary) {
     .join('\n');
 }
 
+// Groq can sit on a connection well past a serverless default. Declaring the
+// ceiling makes the timeout ours to control rather than the platform's, and
+// groq.js budgets its own attempts against this number.
+export const maxDuration = 60;
+
 export async function POST(request) {
+  // These routes spend the operator's Google and Groq quota, so they must
+  // not be callable anonymously.
+  const auth = await requireUser();
+  if (auth.error) return auth.error;
+
   try {
     const { messages, tripContext, itinerary, userApiKey } = await request.json();
 

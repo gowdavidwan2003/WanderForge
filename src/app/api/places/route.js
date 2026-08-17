@@ -1,4 +1,5 @@
 import { NextResponse } from 'next/server';
+import { requireUser } from '@/lib/api/requireUser';
 
 /**
  * Nearby point-of-interest search.
@@ -120,6 +121,11 @@ async function fromGoogle(apiKey, lat, lng, radius, category) {
 }
 
 export async function GET(request) {
+  // These routes spend the operator's Google and Groq quota, so they must
+  // not be callable anonymously.
+  const auth = await requireUser();
+  if (auth.error) return auth.error;
+
   const { searchParams } = new URL(request.url);
   const lat = parseFloat(searchParams.get('lat'));
   const lng = parseFloat(searchParams.get('lng'));

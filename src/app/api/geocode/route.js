@@ -1,4 +1,5 @@
 import { NextResponse } from 'next/server';
+import { requireUser } from '@/lib/api/requireUser';
 
 /**
  * Place lookup for activity locations.
@@ -68,6 +69,11 @@ async function nominatim(query) {
 }
 
 export async function GET(request) {
+  // These routes spend the operator's Google and Groq quota, so they must
+  // not be callable anonymously.
+  const auth = await requireUser();
+  if (auth.error) return auth.error;
+
   const { searchParams } = new URL(request.url);
   const query = searchParams.get('q');
   const nearLat = parseFloat(searchParams.get('lat'));

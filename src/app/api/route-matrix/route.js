@@ -1,4 +1,5 @@
 import { NextResponse } from 'next/server';
+import { requireUser } from '@/lib/api/requireUser';
 
 const ORS_PROFILE = {
   car: 'driving-car',
@@ -89,6 +90,11 @@ async function orsMatrix(apiKey, coordinates, mode) {
 }
 
 export async function POST(request) {
+  // These routes spend the operator's Google and Groq quota, so they must
+  // not be callable anonymously.
+  const auth = await requireUser();
+  if (auth.error) return auth.error;
+
   try {
     const { coordinates, mode = 'car' } = await request.json();
 

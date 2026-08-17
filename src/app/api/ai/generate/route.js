@@ -1,13 +1,25 @@
 import { NextResponse } from 'next/server';
 import { groqChatCompletion } from '@/lib/groq';
 import { REALISM_RULES, TRANSPORT_INFO, BUDGET_INFO } from '@/lib/itineraryPrompt';
+import { requireUser } from '@/lib/api/requireUser';
+import { clampRequestedDays } from '@/lib/tripLimits';
+
+// Groq can sit on a connection well past a serverless default. Declaring the
+// ceiling makes the timeout ours to control rather than the platform's, and
+// groq.js budgets its own attempts against this number.
+export const maxDuration = 60;
 
 export async function POST(request) {
+  // These routes spend the operator's Google and Groq quota, so they must
+  // not be callable anonymously.
+  const auth = await requireUser();
+  if (auth.error) return auth.error;
+
   try {
     const body = await request.json();
     const {
       destination,
-      days,
+      days: requestedDays,
       interests = [],
       transportMode = 'mixed',
       budgetLevel = 'moderate',
@@ -15,6 +27,9 @@ export async function POST(request) {
       userApiKey,
     } = body;
 
+    // `days` is attacker-controlled and drives both cost centres: one AI day per
+    // day, then one billed geocode per activity the model returns.
+    const days = clampRequestedDays(requestedDays);
 
     const transportInfo = TRANSPORT_INFO;
     const budgetInfo = BUDGET_INFO;

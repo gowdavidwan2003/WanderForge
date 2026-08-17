@@ -1,6 +1,12 @@
 import { NextResponse } from 'next/server';
+import { requireUser } from '@/lib/api/requireUser';
 
 export async function GET(request) {
+  // These routes spend the operator's Google and Groq quota, so they must
+  // not be callable anonymously.
+  const auth = await requireUser();
+  if (auth.error) return auth.error;
+
   const { searchParams } = new URL(request.url);
   const lat = searchParams.get('lat');
   const lng = searchParams.get('lng');

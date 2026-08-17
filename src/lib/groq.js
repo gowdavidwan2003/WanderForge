@@ -11,6 +11,37 @@
 
 const GROQ_URL = 'https://api.groq.com/openai/v1/chat/completions';
 
+/**
+ * Time budget, in milliseconds.
+ *
+ * The routes declare `maxDuration = 60`, so everything here has to finish inside
+ * that or the platform kills the invocation and the caller gets an opaque 504
+ * with no error body. Rotation made that worse rather than better: four keys
+ * each waiting indefinitely on a bare fetch could sit far past any ceiling, and
+ * because the catch blocks never logged, a timeout was indistinguishable from a
+ * Groq outage or a bad prompt.
+ *
+ * TOTAL leaves headroom under 60s for the caller's own work — replan-trip issues
+ * a second corrective completion, and the trip editor geocodes afterwards.
+ * PER_ATTEMPT bounds one key so a single stall cannot consume the whole budget.
+ */
+export const TOTAL_BUDGET_MS = 45_000;
+export const PER_ATTEMPT_MS = 20_000;
+
+/**
+ * How long the next key may take, given how long has already elapsed.
+ *
+ * Exported so the guarantee can be tested directly: however many keys rotation
+ * has to try, their timeouts must sum to no more than TOTAL_BUDGET_MS, because
+ * overshooting it means the platform kills the invocation and the caller gets a
+ * 504 with no body instead of an error we chose.
+ *
+ * @returns milliseconds, or <= 0 when the budget is spent
+ */
+export function attemptBudgetMs(elapsedMs, total = TOTAL_BUDGET_MS, perAttempt = PER_ATTEMPT_MS) {
+  return Math.min(perAttempt, total - elapsedMs);
+}
+
 /** Keys to try, in order. A user's own BYOK key always goes first. */
 export function groqKeys(userApiKey) {
   return [
@@ -53,21 +84,52 @@ export async function groqChatCompletion(body, { userApiKey } = {}) {
   }
 
   let lastRateLimitError = null;
+  const startedAt = Date.now();
 
   for (let i = 0; i < keys.length; i++) {
     const key = keys[i];
+
+    // Budget across rotation, not per attempt: without this, four keys each
+    // allowed their own timeout could outlast the route's maxDuration and the
+    // platform would kill the invocation mid-flight.
+    const slice = attemptBudgetMs(Date.now() - startedAt);
+    if (slice <= 0) {
+      console.warn(
+        `[WanderForge] Groq budget of ${TOTAL_BUDGET_MS}ms exhausted after ${i} attempt(s); not trying the remaining ${keys.length - i} key(s).`
+      );
+      return {
+        ok: false,
+        status: 504,
+        timedOut: true,
+        error: 'The AI provider did not respond in time. Please try again.',
+      };
+    }
+
     let res;
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), slice);
 
     try {
       res = await fetch(GROQ_URL, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${key}` },
         body: JSON.stringify(body),
+        signal: controller.signal,
       });
     } catch (err) {
-      // Network failure: worth trying the next key rather than giving up.
-      lastRateLimitError = err.message;
+      // An abort is a stall, not a transport fault, and is worth saying so: a
+      // hung connection used to pin the invocation until the platform killed it,
+      // producing a 504 with no body and nothing in the logs.
+      const stalled = err?.name === 'AbortError';
+      console.warn(
+        `[WanderForge] Groq key ${maskKey(key)} ${stalled ? `stalled after ${slice}ms` : `failed: ${err?.message}`} (${i + 1}/${keys.length}).`
+      );
+      lastRateLimitError = stalled
+        ? `No response within ${Math.round(slice / 1000)}s`
+        : err?.message || 'Network error';
       continue;
+    } finally {
+      clearTimeout(timer);
     }
 
     if (res.ok) {
@@ -87,12 +149,23 @@ export async function groqChatCompletion(body, { userApiKey } = {}) {
       continue;
     }
 
+    // Not a rate limit, so rotation will not help. Log before returning: these
+    // are the failures that used to vanish, leaving a timeout, an outage and a
+    // malformed request indistinguishable from one another.
+    console.error(
+      `[WanderForge] Groq request failed with ${res.status} on key ${maskKey(key)}: ${payload?.error?.message || 'no message'}`
+    );
+
     return {
       ok: false,
       status: res.status,
       error: payload?.error?.message || `Groq API error: ${res.status}`,
     };
   }
+
+  console.error(
+    `[WanderForge] All ${keys.length} Groq key(s) failed. Last error: ${lastRateLimitError || 'unknown'}`
+  );
 
   return {
     ok: false,
