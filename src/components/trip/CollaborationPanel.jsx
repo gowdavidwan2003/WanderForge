@@ -200,10 +200,12 @@ export default function CollaborationPanel({
                     <div className="collab-item__avatar" style={{
                       background: `hsl(${(c.display_name?.charCodeAt(0) || 0) * 40 % 360}, 60%, 50%)`
                     }}>
-                      {(c.display_name || c.email || 'U')[0].toUpperCase()}
+                      {/* No email fallback: client roles cannot read that column
+                          after migration 007. display_name is always set. */}
+                      {(c.display_name || 'U')[0].toUpperCase()}
                     </div>
                     <div className="collab-item__info">
-                      <span className="collab-item__name">{c.display_name || c.email}</span>
+                      <span className="collab-item__name">{c.display_name || 'Collaborator'}</span>
                       <span className="collab-item__role">{c.role}</span>
                       {!c.accepted && <span className="collab-item__pending">Pending</span>}
                     </div>

@@ -29,9 +29,12 @@ export default function ProfilePage({ params }) {
 
   const fetchProfile = async () => {
     try {
+      // Explicit columns, not '*': migration 007 revokes SELECT on
+      // profiles.email from client roles, and Postgres rejects SELECT * unless
+      // the role can read every column.
       const { data: profileData } = await supabase
         .from('profiles')
-        .select('*')
+        .select('id, display_name, avatar_url, bio, countries_visited, trips_count, badges, theme_preference, created_at, updated_at')
         .eq('id', id)
         .single();
 
@@ -134,7 +137,12 @@ export default function ProfilePage({ params }) {
               ) : (
                 <>
                   <h1 className="profile-header__name">{profile.display_name}</h1>
-                  <p className="profile-header__email">{profile.email}</p>
+                  {/* Only ever your own address, read from the session rather
+                      than the table — showing it on a stranger's public profile
+                      was a leak in its own right. */}
+                  {isOwnProfile && user?.email && (
+                    <p className="profile-header__email">{user.email}</p>
+                  )}
                   {profile.bio && <p className="profile-header__bio">{profile.bio}</p>}
                   {isOwnProfile && (
                     <Button variant="ghost" size="sm" onClick={() => setEditing(true)}>Edit Profile</Button>

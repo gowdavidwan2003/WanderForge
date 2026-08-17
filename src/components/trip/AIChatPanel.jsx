@@ -270,8 +270,8 @@ export default function AIChatPanel({ trip, days, activities, isOpen, onClose, o
                         Apply to itinerary
                       </Button>
                     )}
-                    {m.applyError && (
-                      <span className="proposal__error">🔒 {m.applyError}</span>
+                    {msg.applyError && (
+                      <span className="proposal__error">🔒 {msg.applyError}</span>
                     )}
                   </div>
                 )}

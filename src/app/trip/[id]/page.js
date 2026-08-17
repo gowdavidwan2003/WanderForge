@@ -1,7 +1,7 @@
 'use client';
 
-import { useState, useEffect, useCallback, use } from 'react';
-import { useRouter } from 'next/navigation';
+import { useState, useEffect, useCallback, useRef, use } from 'react';
+import { notFound, useRouter } from 'next/navigation';
 import { useAuth } from '@/context/AuthProvider';
 import { useToast } from '@/components/ui/Toast';
 import { getSupabaseBrowserClient } from '@/lib/supabase/client';
@@ -12,6 +12,8 @@ import Modal from '@/components/ui/Modal';
 import LoadingSpinner from '@/components/ui/LoadingSpinner';
 import DynamicMap from '@/components/maps/DynamicMap';
 import CollaborationPanel from '@/components/trip/CollaborationPanel';
+import TripActionBar from '@/components/trip/TripActionBar';
+import ConfirmGenerateModal from '@/components/trip/ConfirmGenerateModal';
 import AIChatPanel from '@/components/trip/AIChatPanel';
 import { useRealtimeTrip } from '@/hooks/useRealtimeTrip';
 import ExpenseSplitPanel from '@/components/trip/ExpenseSplitPanel';
@@ -20,6 +22,7 @@ import { formatMoney, inferCurrency } from '@/lib/currency';
 import NearbyPlacesPanel from '@/components/trip/NearbyPlacesPanel';
 import BookingsPanel from '@/components/trip/BookingsPanel';
 import { bookingsTotal } from '@/lib/bookings';
+import { clearsExistingActivities, orderOffsetFor, planGeneration } from '@/lib/generationGuard';
 import { replanDay } from '@/lib/replanDay';
 
 const CATEGORY_CONFIG = {
@@ -39,6 +42,7 @@ const CATEGORY_CONFIG = {
 export default function TripEditorPage({ params }) {
   const { id } = use(params);
   const [trip, setTrip] = useState(null);
+  const [missing, setMissing] = useState(false);
   const [days, setDays] = useState([]);
   const [activities, setActivities] = useState({});
   const [selectedDay, setSelectedDay] = useState(null);
@@ -46,6 +50,10 @@ export default function TripEditorPage({ params }) {
   const [showActivityModal, setShowActivityModal] = useState(false);
   const [editingActivity, setEditingActivity] = useState(null);
   const [aiGenerating, setAiGenerating] = useState(false);
+  const [aiProgress, setAiProgress] = useState(null);
+  const [pendingGenerate, setPendingGenerate] = useState(null);
+  // Guards against a double-click landing before the aiGenerating state commits.
+  const generatingRef = useRef(false);
   const [weather, setWeather] = useState(null);
   const [selectedActivityId, setSelectedActivityId] = useState(null);
   const [collaborators, setCollaborators] = useState([]);
@@ -117,16 +125,18 @@ export default function TripEditorPage({ params }) {
       return;
     }
 
+    // No email: migration 007 revokes SELECT on that column from client roles,
+    // because a world-readable email list is what let an attacker pick a victim
+    // to impersonate. display_name is always populated by handle_new_user.
     const { data: people } = await supabase
       .from('profiles')
-      .select('id, display_name, email')
+      .select('id, display_name')
       .in('id', rows.map(r => r.user_id));
 
     const byId = Object.fromEntries((people || []).map(p => [p.id, p]));
     setCollaborators(rows.map(c => ({
       ...c,
       display_name: byId[c.user_id]?.display_name,
-      email: byId[c.user_id]?.email,
     })));
   };
 
@@ -145,6 +155,16 @@ export default function TripEditorPage({ params }) {
         supabase.from('trips').select('*').eq('id', id).single(),
         'Loading this trip'
       );
+
+      // A trip that does not exist, or one RLS hides from this user, is a 404
+      // rather than a failure: .single() reports no rows as PGRST116. Record it
+      // and let the render throw notFound(), because notFound() called from this
+      // async callback would escape the error boundary entirely.
+      if (tripErr?.code === 'PGRST116' || (!tripErr && !tripData)) {
+        setMissing(true);
+        return;
+      }
+
       if (tripErr) throw tripErr;
       setTrip(tripData);
 
@@ -422,11 +442,96 @@ export default function TripEditorPage({ params }) {
   };
 
   // AI Generate itinerary
-  const handleAIGenerate = async () => {
-    if (blockedByLock()) return;
-    if (!trip) return;
+  /** Write one generated day's activities, returning how many landed. */
+  const insertDayPlan = async (day, dayPlan, currency, orderOffset = 0) => {
+    const acts = dayPlan?.activities || [];
+    let written = 0;
+
+    for (let i = 0; i < acts.length; i++) {
+      const act = acts[i];
+      let lat = null, lng = null;
+      if (act.location_name) {
+        // location_name usually already carries the town; appending the
+        // destination again produced queries no geocoder could match.
+        const geo = await geocodeLocation(
+          act.location_name,
+          trip.dest_lat != null ? { lat: trip.dest_lat, lng: trip.dest_lng } : null
+        );
+        if (geo) { lat = geo.lat; lng = geo.lng; }
+      }
+
+      const { error } = await supabase.from('activities').insert({
+        trip_day_id: day.id,
+        title: act.title,
+        description: act.description || '',
+        location_name: act.location_name || '',
+        category: act.category || 'sightseeing',
+        start_time: act.start_time || null,
+        end_time: act.end_time || null,
+        cost: parseFloat(act.cost) || 0,
+        notes: act.notes || '',
+        booking_link: act.booking_link || '',
+        order_index: orderOffset + i,
+        currency: currency || trip.currency || 'USD',
+        latitude: lat,
+        longitude: lng,
+      });
+
+      if (!error) written++;
+      setAiProgress((p) => (p ? { ...p, done: p.done + 1 } : p));
+    }
+
+    return written;
+  };
+
+  /** Adopt the AI's local currency and backfill destination coords for weather. */
+  const applyTripMetadata = async (data) => {
+    const detected = data.currency || inferCurrency(trip.destination);
+    if (detected && detected !== trip.currency) {
+      await supabase.from('trips').update({ currency: detected }).eq('id', trip.id);
+    }
+
+    if (!trip.dest_lat) {
+      const destGeo = await geocodeLocation(trip.destination);
+      if (destGeo) {
+        await supabase.from('trips').update({
+          dest_lat: destGeo.lat, dest_lng: destGeo.lng,
+        }).eq('id', trip.id);
+        fetchWeather(destGeo.lat, destGeo.lng);
+      }
+    }
+  };
+
+  /**
+   * Generate a whole itinerary.
+   *
+   * `mode` is 'replace' or 'append'. Generation used to insert unconditionally,
+   * so a second press — an obvious thing to try after a disappointing result, or
+   * after a long silent run that looks stuck — wrote a complete second copy of
+   * every activity with colliding order_index values, and the only way back was
+   * deleting them one at a time. handleAIGenerate now refuses to run blind and
+   * asks first; this does the work once a choice has been made.
+   */
+  const runGenerate = async (mode) => {
+    // A ref, not the aiGenerating state: state updates are asynchronous, so two
+    // clicks landing in the same tick could both pass a state-based check.
+    if (generatingRef.current) return;
+    generatingRef.current = true;
+    setPendingGenerate(null);
     setAiGenerating(true);
+    setAiProgress({ phase: 'planning', done: 0, total: 0 });
+
     try {
+      if (clearsExistingActivities(mode)) {
+        const dayIds = days.map((d) => d.id);
+        if (dayIds.length) {
+          const { error } = await supabase.from('activities').delete().in('trip_day_id', dayIds);
+          // Abort rather than generate: a failed clear followed by a successful
+          // insert reproduces exactly the duplication this guard exists to stop.
+          if (error) throw new Error(`Could not clear the old itinerary: ${error.message}`);
+        }
+      }
+
       const res = await fetch('/api/ai/generate', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
@@ -444,71 +549,111 @@ export default function TripEditorPage({ params }) {
       if (data.error) throw new Error(data.error);
       if (!data.itinerary) throw new Error('No itinerary returned');
 
-      // Insert generated activities into each day
+      const total = data.itinerary.reduce((s, d) => s + (d.activities?.length || 0), 0);
+      setAiProgress({ phase: 'saving', done: 0, total });
+
+      let written = 0;
       for (const dayPlan of data.itinerary) {
-        const dayNum = dayPlan.day;
-        const day = days.find(d => d.day_number === dayNum);
-        if (!day || !dayPlan.activities) continue;
-
-        for (let i = 0; i < dayPlan.activities.length; i++) {
-          const act = dayPlan.activities[i];
-          // Geocode each activity
-          let lat = null, lng = null;
-          if (act.location_name) {
-            // location_name usually already carries the town; appending the
-            // destination again produced queries no geocoder could match.
-            const geo = await geocodeLocation(
-              act.location_name,
-              trip.dest_lat != null ? { lat: trip.dest_lat, lng: trip.dest_lng } : null
-            );
-            if (geo) { lat = geo.lat; lng = geo.lng; }
-          }
-
-          await supabase.from('activities').insert({
-            trip_day_id: day.id,
-            title: act.title,
-            description: act.description || '',
-            location_name: act.location_name || '',
-            category: act.category || 'sightseeing',
-            start_time: act.start_time || null,
-            end_time: act.end_time || null,
-            cost: parseFloat(act.cost) || 0,
-            notes: act.notes || '',
-            booking_link: act.booking_link || '',
-            order_index: i,
-            currency: data.currency || trip.currency || 'USD',
-            latitude: lat,
-            longitude: lng,
-          });
-        }
+        const day = days.find((d) => d.day_number === dayPlan.day);
+        if (!day) continue;
+        // Appending must not reuse order_index values already on the day.
+        const offset = orderOffsetFor(mode, activities[day.id]?.length || 0);
+        written += await insertDayPlan(day, dayPlan, data.currency, offset);
       }
 
-      // The AI reports the destination's local currency. Adopt it so costs are no
-      // longer labelled with whatever the wizard dropdown happened to default to.
-      const detected = data.currency || inferCurrency(trip.destination);
-      if (detected && detected !== trip.currency) {
-        await supabase.from('trips').update({ currency: detected }).eq('id', trip.id);
-      }
+      await applyTripMetadata(data);
 
-      // Also geocode destination for weather
-      if (!trip.dest_lat) {
-        const destGeo = await geocodeLocation(trip.destination);
-        if (destGeo) {
-          await supabase.from('trips').update({
-            dest_lat: destGeo.lat, dest_lng: destGeo.lng
-          }).eq('id', trip.id);
-          fetchWeather(destGeo.lat, destGeo.lng);
-        }
-      }
-
-      toast.success(`${data.itinerary.length} days generated with ${data.itinerary.reduce((s, d) => s + (d.activities?.length || 0), 0)} activities!`, 'AI Itinerary Ready 🤖');
+      toast.success(
+        `${data.itinerary.length} days planned, ${written} activities saved.`,
+        mode === 'append' ? 'Added to your itinerary 🤖' : 'AI Itinerary Ready 🤖'
+      );
       fetchTripData();
     } catch (err) {
       toast.error(err.message, 'AI Generation Failed');
     } finally {
+      generatingRef.current = false;
       setAiGenerating(false);
+      setAiProgress(null);
     }
   };
+
+  const handleAIGenerate = () => {
+    if (!trip) return;
+    // blockedByLock() also raises a toast explaining why, so call it first.
+    if (blockedByLock()) return;
+
+    const decision = planGeneration({
+      existingCount: Object.values(activities).flat().length,
+      inFlight: generatingRef.current,
+      locked: isLocked,
+    });
+
+    if (decision.action === 'ignore') return;
+    if (decision.action === 'confirm') {
+      setPendingGenerate({ existing: decision.existing });
+      return;
+    }
+
+    runGenerate(decision.mode);
+  };
+
+  /**
+   * Fill just the selected day.
+   *
+   * This button used to call handleAIGenerate, so "AI Fill" on one empty day
+   * regenerated the entire trip. replanDay cannot be reused here — it rejects an
+   * empty day outright — so ask for a single day's plan instead, which also costs
+   * a fraction of the tokens of a full trip.
+   */
+  const handleAIFillDay = async () => {
+    if (blockedByLock() || !trip || !selectedDay) return;
+    if (generatingRef.current) return;
+    generatingRef.current = true;
+    setAiGenerating(true);
+    setAiProgress({ phase: 'planning', done: 0, total: 0 });
+
+    try {
+      const res = await fetch('/api/ai/generate', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          destination: trip.destination,
+          days: 1,
+          interests: trip.ai_preferences?.interests || [],
+          transportMode: trip.transport_mode,
+          budgetLevel: trip.ai_preferences?.budget_level || 'moderate',
+          notes: trip.ai_preferences?.notes || '',
+        }),
+      });
+
+      const data = await res.json();
+      if (data.error) throw new Error(data.error);
+
+      const dayPlan = data.itinerary?.[0];
+      if (!dayPlan?.activities?.length) throw new Error('The AI returned an empty day.');
+
+      setAiProgress({ phase: 'saving', done: 0, total: dayPlan.activities.length });
+      const offset = activities[selectedDay.id]?.length || 0;
+      const written = await insertDayPlan(selectedDay, dayPlan, data.currency, offset);
+      await applyTripMetadata(data);
+
+      toast.success(
+        `Day ${selectedDay.day_number} filled with ${written} activities.`,
+        dayPlan.theme || 'Day Planned 🤖'
+      );
+      fetchTripData();
+    } catch (err) {
+      toast.error(err.message, 'AI Fill Failed');
+    } finally {
+      generatingRef.current = false;
+      setAiGenerating(false);
+      setAiProgress(null);
+    }
+  };
+
+  // Thrown during render so the not-found boundary catches it. Calling
+  // notFound() from the fetch callback would not be caught at all.
+  if (missing) notFound();
 
   if (loading) {
     return (
@@ -559,7 +704,69 @@ export default function TripEditorPage({ params }) {
                   <span>📋 {allActivities.length} activities</span>
                 </div>
               </div>
-              <div className="editor__header-actions">
+              <TripActionBar
+                actions={[
+                  isOwner && {
+                    key: 'lock',
+                    label: isLocked ? 'Unlock' : 'Lock',
+                    icon: isLocked ? '🔒' : '🔓',
+                    variant: isLocked ? 'primary' : 'ghost',
+                    onClick: handleToggleLock,
+                    loading: togglingLock,
+                    disabled: togglingLock,
+                    title: isLocked
+                      ? 'Unlock so the group can edit the itinerary again'
+                      : 'Freeze the itinerary so nobody can change it',
+                  },
+                  {
+                    key: 'nearby',
+                    label: 'Find Nearby',
+                    icon: '🧭',
+                    onClick: () => setShowNearby(true),
+                    disabled: isLocked,
+                  },
+                  {
+                    key: 'bookings',
+                    label: 'Bookings',
+                    icon: '🏨',
+                    onClick: () => setShowBookings(true),
+                  },
+                  {
+                    key: 'locate',
+                    label: locating ? `Locating ${locating.done}/${locating.total}` : 'Locate on Map',
+                    icon: '📍',
+                    onClick: handleLocateActivities,
+                    loading: !!locating,
+                    disabled: !!locating || isLocked,
+                  },
+                  {
+                    key: 'conflicts',
+                    label: 'Check Itinerary',
+                    icon: '🔍',
+                    onClick: () => setShowConflicts(true),
+                  },
+                  {
+                    key: 'expenses',
+                    label: 'Split Bills',
+                    icon: '🧾',
+                    onClick: () => setShowExpenses(true),
+                  },
+                ].filter(Boolean)}
+                primaryAction={{
+                  key: 'ai-generate',
+                  // A silent multi-minute run is what makes people click again,
+                  // so say which phase it is in and how far along.
+                  label: !aiGenerating
+                    ? 'AI Generate'
+                    : aiProgress?.phase === 'saving' && aiProgress.total
+                      ? `Saving ${aiProgress.done}/${aiProgress.total}`
+                      : 'Planning your trip...',
+                  icon: '🤖',
+                  onClick: handleAIGenerate,
+                  loading: aiGenerating,
+                  disabled: aiGenerating || isLocked,
+                }}
+              >
                 <CollaborationPanel
                   tripId={id}
                   trip={trip}
@@ -570,75 +777,7 @@ export default function TripEditorPage({ params }) {
                   onlineUsers={onlineUsers}
                   onRefresh={() => { fetchCollaborators(); fetchTripData(); }}
                 />
-                {isOwner && (
-                  <Button
-                    variant={isLocked ? 'primary' : 'ghost'}
-                    size="sm"
-                    onClick={handleToggleLock}
-                    loading={togglingLock}
-                    disabled={togglingLock}
-                    icon={<span>{isLocked ? '🔒' : '🔓'}</span>}
-                    title={isLocked
-                      ? 'Unlock so the group can edit the itinerary again'
-                      : 'Freeze the itinerary so nobody can change it'}
-                  >
-                    {isLocked ? 'Unlock' : 'Lock'}
-                  </Button>
-                )}
-                <Button
-                  variant="ghost"
-                  size="sm"
-                  onClick={() => setShowNearby(true)}
-                  disabled={isLocked}
-                  icon={<span>🧭</span>}
-                >
-                  Find Nearby
-                </Button>
-                <Button
-                  variant="ghost"
-                  size="sm"
-                  onClick={() => setShowBookings(true)}
-                  icon={<span>🏨</span>}
-                >
-                  Bookings
-                </Button>
-                <Button
-                  variant="ghost"
-                  size="sm"
-                  onClick={handleLocateActivities}
-                  loading={!!locating}
-                  disabled={!!locating || isLocked}
-                  icon={<span>📍</span>}
-                >
-                  {locating ? `Locating ${locating.done}/${locating.total}` : 'Locate on Map'}
-                </Button>
-                <Button
-                  variant="ghost"
-                  size="sm"
-                  onClick={() => setShowConflicts(true)}
-                  icon={<span>🔍</span>}
-                >
-                  Check Itinerary
-                </Button>
-                <Button
-                  variant="ghost"
-                  size="sm"
-                  onClick={() => setShowExpenses(true)}
-                  icon={<span>🧾</span>}
-                >
-                  Split Bills
-                </Button>
-                <Button
-                  variant="primary"
-                  size="sm"
-                  onClick={handleAIGenerate}
-                  loading={aiGenerating}
-                  disabled={aiGenerating || isLocked}
-                  icon={<span>🤖</span>}
-                >
-                  {aiGenerating ? 'Generating...' : 'AI Generate'}
-                </Button>
-              </div>
+              </TripActionBar>
             </div>
           </div>
         </div>
@@ -749,10 +888,18 @@ export default function TripEditorPage({ params }) {
                       <div className="main__empty">
                         <span>🗓️</span>
                         <h3>No activities yet</h3>
-                        <p>Click &quot;AI Generate&quot; to auto-fill, or add manually</p>
+                        <p>Fill just this day with AI, or add activities yourself</p>
                         <div style={{ display: 'flex', gap: '8px', justifyContent: 'center', marginTop: '12px' }}>
                           <Button variant="primary" size="sm" onClick={openAddActivity} disabled={isLocked}>+ Add Manually</Button>
-                          <Button variant="secondary" size="sm" onClick={handleAIGenerate} loading={aiGenerating}>🤖 AI Fill</Button>
+                          <Button
+                            variant="secondary"
+                            size="sm"
+                            onClick={handleAIFillDay}
+                            loading={aiGenerating}
+                            disabled={aiGenerating || isLocked}
+                          >
+                            🤖 Fill Day {selectedDay.day_number}
+                          </Button>
                         </div>
                       </div>
                     ) : (
@@ -861,6 +1008,13 @@ export default function TripEditorPage({ params }) {
         </div>
       </Modal>
 
+      <ConfirmGenerateModal
+        pending={pendingGenerate}
+        onCancel={() => setPendingGenerate(null)}
+        onReplace={() => runGenerate('replace')}
+        onAppend={() => runGenerate('append')}
+      />
+
       <NearbyPlacesPanel
         trip={{ ...trip, currency: tripCurrency }}
         days={days}
@@ -950,7 +1104,10 @@ export default function TripEditorPage({ params }) {
           flex-wrap: wrap;
         }
 
-        .editor__header-actions { display: flex; gap: var(--space-2); flex-shrink: 0; }
+        /* The action row lives in TripActionBar, which owns its own wrapping and
+           its below-768px overflow menu. The rule that used to be here set
+           flex-shrink: 0 with no flex-wrap, which pushed AI Generate off-screen
+           on phones. */
 
         .editor__back {
           background: none; border: none;

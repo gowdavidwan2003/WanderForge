@@ -10,7 +10,9 @@ import { useAuth } from '@/context/AuthProvider';
 import { formatMoney, currencySymbol } from '@/lib/currency';
 import { computeBalances, settle } from '@/lib/settlement';
 
-const nameOf = (m) => m?.display_name || m?.email?.split('@')[0] || 'Unknown';
+// Emails are no longer readable by client roles (migration 007), so display_name
+// is the only label available. handle_new_user always sets one at signup.
+const nameOf = (m) => m?.display_name || 'Unknown';
 const avatarHue = (label) => ((label?.charCodeAt(0) || 0) * 40) % 360;
 
 /**
@@ -58,14 +60,14 @@ export default function ExpenseSplitPanel({ tripId, trip, collaborators = [], is
       const ids = [trip?.user_id, ...(collaborators || []).filter(c => c.accepted).map(c => c.user_id)]
         .filter(Boolean);
       if (ids.length) {
+        // email is not selectable by client roles after migration 007.
         const { data: people } = await supabase
           .from('profiles')
-          .select('id, display_name, email')
+          .select('id, display_name')
           .in('id', ids);
         memberList = (people || []).map(p => ({
           user_id: p.id,
           display_name: p.display_name,
-          email: p.email,
           role: p.id === trip?.user_id ? 'owner' : 'editor',
         }));
       }
