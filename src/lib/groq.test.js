@@ -137,6 +137,61 @@ describe('groqChatCompletion', () => {
     expect(global.fetch).toHaveBeenCalledTimes(1);
   });
 
+  // A transport failure and an exhausted quota need different responses from the
+  // user — retry now versus wait or add a key — but both used to arrive as the
+  // same "all keys have hit their rate limit" message, because a caught network
+  // error was assigned to lastRateLimitError and reported as exhaustion.
+  it('distinguishes a network failure from a genuine rate limit', async () => {
+    global.fetch = vi.fn(async () => {
+      throw new TypeError('fetch failed');
+    });
+    const networkResult = await groqChatCompletion({ model: 'x', messages: [] });
+
+    global.fetch = vi.fn(async () => ({
+      ok: false,
+      status: 429,
+      json: async () => ({ error: { message: 'Rate limit reached for llama-3.3-70b' } }),
+    }));
+    const rateLimitResult = await groqChatCompletion({ model: 'x', messages: [] });
+
+    expect(networkResult.ok).toBe(false);
+    expect(rateLimitResult.ok).toBe(false);
+
+    // The surfaced text must differ, otherwise the two are indistinguishable.
+    expect(networkResult.error).not.toBe(rateLimitResult.error);
+    expect(networkResult.error).toMatch(/fetch failed/i);
+    expect(rateLimitResult.error).toMatch(/rate limit/i);
+
+    // And a transport failure must not claim a rate limit, which would send the
+    // user looking for another API key for a problem quota had nothing to do with.
+    expect(networkResult.error).not.toMatch(/rate limit/i);
+    expect(networkResult.unreachable).toBe(true);
+    expect(networkResult.exhausted).toBeUndefined();
+
+    expect(rateLimitResult.exhausted).toBe(true);
+    expect(rateLimitResult.status).toBe(429);
+    expect(networkResult.status).toBe(503);
+  });
+
+  it('logs a transport failure and a rate limit differently', async () => {
+    const warn = vi.spyOn(console, 'warn');
+
+    global.fetch = vi.fn(async () => { throw new TypeError('fetch failed'); });
+    await groqChatCompletion({ model: 'x', messages: [] });
+    const networkLogs = warn.mock.calls.flat().join(' ');
+
+    warn.mockClear();
+    global.fetch = vi.fn(async () => ({
+      ok: false, status: 429, json: async () => ({ error: { message: 'rate limit' } }),
+    }));
+    await groqChatCompletion({ model: 'x', messages: [] });
+    const rateLogs = warn.mock.calls.flat().join(' ');
+
+    expect(networkLogs).toMatch(/failed/i);
+    expect(rateLogs).toMatch(/rate-limited/i);
+    expect(networkLogs).not.toBe(rateLogs);
+  });
+
   it('rotates to the next key on a rate limit', async () => {
     process.env.GROQ_API_KEY_2 = 'test-key-2';
     let call = 0;

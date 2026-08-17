@@ -125,20 +125,122 @@ const PLACE_TO_CURRENCY = [
 ];
 
 /**
+ * Regions — countries, states, provinces — outrank city names.
+ *
+ * Some city names are genuinely ambiguous rather than a matching bug: Lima is in
+ * both Peru and Ohio, Santiago in Chile and several other countries. Tokenising
+ * cannot resolve those, but the surrounding region can, and a region is the more
+ * authoritative signal for currency. "Lima, Ohio" therefore resolves through
+ * "ohio" rather than "lima".
+ *
+ * US states are listed because the reported symptom was US destinations billing
+ * in rupees, and a bare city name like "Indianapolis" is otherwise unresolvable.
+ */
+const REGIONS = new Set([
+  'india', 'karnataka', 'kerala', 'goa', 'japan', 'united kingdom', 'england',
+  'scotland', 'wales', 'united states', 'usa', 'france', 'italy', 'spain',
+  'germany', 'netherlands', 'portugal', 'greece', 'austria', 'ireland',
+  'belgium', 'finland', 'croatia', 'estonia', 'slovenia', 'malta', 'australia',
+  'canada', 'singapore', 'uae', 'emirates', 'thailand', 'indonesia', 'bali',
+  'malaysia', 'switzerland', 'china', 'south korea', 'korea', 'vietnam',
+  'sri lanka', 'nepal', 'south africa', 'brazil', 'mexico', 'turkey', 'egypt',
+  'morocco', 'new zealand', 'philippines', 'russia', 'sweden', 'norway',
+  'denmark', 'poland', 'czech', 'hungary', 'iceland', 'peru', 'argentina',
+  'chile', 'kenya', 'tanzania', 'qatar', 'saudi', 'israel', 'hong kong',
+  'taiwan', 'cuba', 'maldives',
+  // US states, so a US city resolves to USD instead of falling through to a
+  // same-named city elsewhere.
+  'alabama', 'alaska', 'arizona', 'arkansas', 'california', 'colorado',
+  'connecticut', 'delaware', 'florida', 'georgia', 'hawaii', 'idaho',
+  'illinois', 'indiana', 'iowa', 'kansas', 'kentucky', 'louisiana', 'maine',
+  'maryland', 'massachusetts', 'michigan', 'minnesota', 'mississippi',
+  'missouri', 'montana', 'nebraska', 'nevada', 'new hampshire', 'new jersey',
+  'new mexico', 'new york state', 'north carolina', 'north dakota', 'ohio',
+  'oklahoma', 'oregon', 'pennsylvania', 'rhode island', 'south carolina',
+  'south dakota', 'tennessee', 'texas', 'utah', 'vermont', 'virginia',
+  'washington', 'west virginia', 'wisconsin', 'wyoming',
+]);
+
+// US states not already carrying a currency mapping above.
+const US_STATE_CURRENCY = [
+  'alabama', 'alaska', 'arizona', 'arkansas', 'california', 'colorado',
+  'connecticut', 'delaware', 'florida', 'georgia', 'idaho', 'illinois',
+  'indiana', 'iowa', 'kansas', 'kentucky', 'louisiana', 'maine', 'maryland',
+  'massachusetts', 'michigan', 'minnesota', 'mississippi', 'missouri',
+  'montana', 'nebraska', 'nevada', 'new hampshire', 'new jersey', 'new mexico',
+  'new york state', 'north carolina', 'north dakota', 'ohio', 'oklahoma',
+  'oregon', 'pennsylvania', 'rhode island', 'south carolina', 'south dakota',
+  'tennessee', 'texas', 'utah', 'vermont', 'virginia', 'washington',
+  'west virginia', 'wisconsin', 'wyoming',
+].map((state) => [state, 'USD']);
+
+/** Lowercase, strip accents, and reduce anything non-alphanumeric to a gap. */
+function tokenize(value) {
+  return String(value)
+    .toLowerCase()
+    .normalize('NFD')
+    .replace(/[̀-ͯ]/g, '')
+    .replace(/[^a-z0-9]+/g, ' ')
+    .trim()
+    .split(' ')
+    .filter(Boolean);
+}
+
+const PLACE_ENTRIES = [...PLACE_TO_CURRENCY, ...US_STATE_CURRENCY].map(([place, code]) => ({
+  place,
+  code,
+  words: tokenize(place),
+  isRegion: REGIONS.has(place),
+}));
+
+/**
  * Best-effort currency for a destination string. Returns null when unknown, so
  * callers can fall back rather than silently mislabelling amounts.
+ *
+ * Matches whole words, not substrings. The previous implementation asked whether
+ * the destination *contained* each place name, so "india" matched inside
+ * "Indiana" — and because the longest hit won, "Indianapolis, Indiana" and even
+ * "Indiana, USA" resolved to INR while "usa" was ignored as the shorter match.
+ * Every US destination whose name happens to contain a place name was billed in
+ * the wrong currency.
+ *
+ * Ranking, in order: a region beats a city, then more words beats fewer, then
+ * longer beats shorter. Ties fall back to table order so the result is stable.
  */
 export function inferCurrency(destination) {
   if (!destination) return null;
-  const q = destination.toLowerCase();
 
-  // Longest match wins: "new zealand" must beat "zealand"-style partial hits.
+  const tokens = tokenize(destination);
+  if (tokens.length === 0) return null;
+
+  const matches = (words) => {
+    if (words.length === 0 || words.length > tokens.length) return false;
+    // Contiguous run of whole tokens, so "new york" matches but "york" alone
+    // does not match "new york", and "india" never matches "indiana".
+    for (let i = 0; i <= tokens.length - words.length; i++) {
+      let hit = true;
+      for (let j = 0; j < words.length; j++) {
+        if (tokens[i + j] !== words[j]) { hit = false; break; }
+      }
+      if (hit) return true;
+    }
+    return false;
+  };
+
   let best = null;
-  for (const [place, code] of PLACE_TO_CURRENCY) {
-    if (q.includes(place) && (!best || place.length > best.place.length)) {
-      best = { place, code };
+  for (const entry of PLACE_ENTRIES) {
+    if (!matches(entry.words)) continue;
+    if (
+      !best ||
+      (entry.isRegion !== best.isRegion ? entry.isRegion : false) ||
+      (entry.isRegion === best.isRegion &&
+        (entry.words.length > best.words.length ||
+          (entry.words.length === best.words.length && entry.place.length > best.place.length)))
+    ) {
+      best = entry;
     }
   }
+
   return best?.code ?? null;
 }
 
@@ -150,10 +252,17 @@ export function currencySymbol(code) {
 export function formatMoney(amount, code, { decimals = 0 } = {}) {
   const value = Number(amount) || 0;
   const symbol = currencySymbol(code);
-  const formatted = value.toLocaleString(undefined, {
+
+  // Sign before the symbol. Formatting the signed value put it after — "$-50.00"
+  // rather than "-$50.00".
+  const sign = value < 0 ? '-' : '';
+  const formatted = Math.abs(value).toLocaleString(undefined, {
     minimumFractionDigits: decimals,
     maximumFractionDigits: decimals,
   });
+
   // Codes without a distinct glyph read better with a space: "AED 400", "₹400".
-  return /^[A-Z]{2,4}\$?$/.test(symbol) ? `${symbol} ${formatted}` : `${symbol}${formatted}`;
+  return /^[A-Z]{2,4}\$?$/.test(symbol)
+    ? `${sign}${symbol} ${formatted}`
+    : `${sign}${symbol}${formatted}`;
 }
