@@ -207,15 +207,66 @@ export async function exportTripToPDF(trip, days, activities, bookings = {}) {
   doc.save(filename);
 }
 
+/** Shift a yyyymmdd string by whole days, staying in UTC to avoid DST drift. */
+function shiftDateStamp(stamp, days) {
+  const y = Number(stamp.slice(0, 4));
+  const m = Number(stamp.slice(4, 6));
+  const d = Number(stamp.slice(6, 8));
+  const dt = new Date(Date.UTC(y, m - 1, d));
+  dt.setUTCDate(dt.getUTCDate() + days);
+  return dt.toISOString().slice(0, 10).replace(/-/g, '');
+}
+
 /**
- * Export trip as iCalendar (.ics) file
+ * Fold lines to 75 octets, as RFC 5545 requires.
+ *
+ * Long values — an activity description, a venue name — produced lines well past
+ * the limit. Google Calendar tolerates them; stricter parsers reject the file
+ * outright, which made "export to calendar" work or not depending on where it
+ * was opened. Continuation lines begin with a single space.
  */
-export function exportTripToCalendar(trip, days, activities, bookings = {}) {
+function foldIcalLines(lines) {
+  const folded = [];
+  for (const line of lines) {
+    if (line.length <= 75) { folded.push(line); continue; }
+    folded.push(line.slice(0, 75));
+    let rest = line.slice(75);
+    while (rest.length > 74) {
+      folded.push(` ${rest.slice(0, 74)}`);
+      rest = rest.slice(74);
+    }
+    if (rest.length) folded.push(` ${rest}`);
+  }
+  return folded;
+}
+
+/**
+ * Build the iCalendar body for a trip.
+ *
+ * Separated from the download so it can be tested. Previously the only way to
+ * see the output was to click Export in a browser and open the file, so the ICS
+ * was never validated: it shipped without the DTSTAMP every VEVENT requires, with
+ * lines past the 75-octet limit, and with all-day stay events whose DTEND equalled
+ * their DTSTART — a zero-length event that calendars silently drop, so a booking
+ * with no check-out date simply never appeared.
+ *
+ * @returns {string} CRLF-delimited iCalendar text
+ */
+export function buildTripCalendar(trip, daysInput, activitiesInput, bookingsInput) {
+  // Defaults, not default parameters: callers pass explicit nulls from state that
+  // has not loaded yet, and `= []` does not apply to null.
+  const days = Array.isArray(daysInput) ? daysInput : [];
+  const activities = activitiesInput || {};
+  const bookings = bookingsInput || {};
+
+  // One stamp for the whole file: DTSTAMP is when the event was generated.
+  const dtstamp = `${new Date().toISOString().replace(/[-:]/g, '').split('.')[0]}Z`;
+
   let ical = [
     'BEGIN:VCALENDAR',
     'VERSION:2.0',
     'PRODID:-//WanderForge//EN',
-    `X-WR-CALNAME:${trip.title || 'Trip'}`,
+    `X-WR-CALNAME:${escapeIcal(trip?.title || 'Trip')}`,
     'CALSCALE:GREGORIAN',
     'METHOD:PUBLISH',
   ];
@@ -228,15 +279,24 @@ export function exportTripToCalendar(trip, days, activities, bookings = {}) {
       if (!dateStr) continue;
 
       const startTime = act.start_time ? act.start_time.replace(/:/g, '').slice(0, 4) + '00' : '090000';
-      const endTime = act.end_time ? act.end_time.replace(/:/g, '').slice(0, 4) + '00' : '100000';
+      let endTime = act.end_time ? act.end_time.replace(/:/g, '').slice(0, 4) + '00' : '100000';
+      let endDate = dateStr;
+
+      // An activity ending at or before it starts — a late-night entry running
+      // past midnight, or simply bad data — produced DTEND <= DTSTART, which is
+      // invalid. Roll the end onto the next day, which is what the times mean.
+      if (endTime <= startTime) {
+        endDate = shiftDateStamp(dateStr, 1);
+      }
 
       const uid = `${act.id}@wanderforge`;
 
       ical.push(
         'BEGIN:VEVENT',
         `UID:${uid}`,
+        `DTSTAMP:${dtstamp}`,
         `DTSTART:${dateStr}T${startTime}`,
-        `DTEND:${dateStr}T${endTime}`,
+        `DTEND:${endDate}T${endTime}`,
         `SUMMARY:${escapeIcal(act.title)}`,
         act.location_name ? `LOCATION:${escapeIcal(act.location_name)}` : '',
         act.description ? `DESCRIPTION:${escapeIcal(act.description)}${act.notes ? '\\n\\nTip: ' + escapeIcal(act.notes) : ''}` : '',
@@ -252,10 +312,20 @@ export function exportTripToCalendar(trip, days, activities, bookings = {}) {
   for (const s of bookings.stays || []) {
     if (!s.check_in) continue;
     const start = s.check_in.replace(/-/g, '');
-    const end = (s.check_out || s.check_in).replace(/-/g, '');
+    let end = (s.check_out || '').replace(/-/g, '');
+
+    // DTEND is exclusive for an all-day event, so check-out is already the right
+    // value for a hotel stay. But falling back to check_in when check-out is
+    // missing made DTSTART equal DTEND — a zero-length event that calendars drop,
+    // so the booking never appeared at all. Same if the dates are reversed.
+    if (!end || end <= start) {
+      end = shiftDateStamp(start, 1);
+    }
+
     ical.push(
       'BEGIN:VEVENT',
       `UID:stay-${s.id}@wanderforge`,
+      `DTSTAMP:${dtstamp}`,
       `DTSTART;VALUE=DATE:${start}`,
       `DTEND;VALUE=DATE:${end}`,
       `SUMMARY:${escapeIcal(`Stay: ${s.name}`)}`,
@@ -268,12 +338,30 @@ export function exportTripToCalendar(trip, days, activities, bookings = {}) {
 
   for (const t of bookings.transport || []) {
     if (!t.departure_time) continue;
-    const stamp = (v) => new Date(v).toISOString().replace(/[-:]/g, '').split('.')[0] + 'Z';
+    const stamp = (v) => {
+      const d = new Date(v);
+      return Number.isNaN(d.getTime())
+        ? null
+        : `${d.toISOString().replace(/[-:]/g, '').split('.')[0]}Z`;
+    };
+
+    const start = stamp(t.departure_time);
+    if (!start) continue; // an unparseable departure would emit a broken DTSTART
+
+    // An arrival at or before departure is invalid; default to an hour.
+    let end = stamp(t.arrival_time);
+    if (!end || end <= start) {
+      const d = new Date(t.departure_time);
+      d.setUTCHours(d.getUTCHours() + 1);
+      end = `${d.toISOString().replace(/[-:]/g, '').split('.')[0]}Z`;
+    }
+
     ical.push(
       'BEGIN:VEVENT',
       `UID:transport-${t.id}@wanderforge`,
-      `DTSTART:${stamp(t.departure_time)}`,
-      `DTEND:${stamp(t.arrival_time || t.departure_time)}`,
+      `DTSTAMP:${dtstamp}`,
+      `DTSTART:${start}`,
+      `DTEND:${end}`,
       `SUMMARY:${escapeIcal(`${(t.type || 'Transport').replace('_', ' ')}: ${t.from_location || '?'} to ${t.to_location || '?'}`)}`,
       t.booking_link ? `URL:${t.booking_link}` : '',
       'CATEGORIES:transport',
@@ -283,12 +371,27 @@ export function exportTripToCalendar(trip, days, activities, bookings = {}) {
 
   ical.push('END:VCALENDAR');
 
-  const content = ical.filter(Boolean).join('\r\n');
+  return foldIcalLines(ical.filter(Boolean)).join('\r\n');
+}
+
+/** Filename for a trip's .ics download. */
+export function calendarFilename(trip) {
+  return `${(trip?.title || 'trip').replace(/[^a-zA-Z0-9]/g, '_')}.ics`;
+}
+
+/**
+ * Export trip as an iCalendar (.ics) file.
+ *
+ * Download only — all the generation lives in buildTripCalendar so it can be
+ * tested without a DOM.
+ */
+export function exportTripToCalendar(trip, days, activities, bookings = {}) {
+  const content = buildTripCalendar(trip, days, activities, bookings);
   const blob = new Blob([content], { type: 'text/calendar;charset=utf-8' });
   const url = URL.createObjectURL(blob);
   const link = document.createElement('a');
   link.href = url;
-  link.download = `${(trip.title || 'trip').replace(/[^a-zA-Z0-9]/g, '_')}.ics`;
+  link.download = calendarFilename(trip);
   link.click();
   URL.revokeObjectURL(url);
 }
@@ -298,7 +401,9 @@ function escapeIcal(text) {
     .replace(/\\/g, '\\\\')
     .replace(/;/g, '\\;')
     .replace(/,/g, '\\,')
-    .replace(/\n/g, '\\n');
+    // CRLF first: replacing only \n left the carriage return in place, which
+    // terminates the line early and truncates the value.
+    .replace(/\r\n|\r|\n/g, '\\n');
 }
 
 /**

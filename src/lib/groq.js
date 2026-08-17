@@ -83,7 +83,12 @@ export async function groqChatCompletion(body, { userApiKey } = {}) {
     };
   }
 
+  // Tracked apart so the final message can say which actually happened. Folding
+  // both into one variable meant a DNS failure or a dropped connection was
+  // reported as "all keys have hit their rate limit", sending the user off to
+  // find another API key for a problem that had nothing to do with quota.
   let lastRateLimitError = null;
+  let lastTransportError = null;
   const startedAt = Date.now();
 
   for (let i = 0; i < keys.length; i++) {
@@ -124,7 +129,7 @@ export async function groqChatCompletion(body, { userApiKey } = {}) {
       console.warn(
         `[WanderForge] Groq key ${maskKey(key)} ${stalled ? `stalled after ${slice}ms` : `failed: ${err?.message}`} (${i + 1}/${keys.length}).`
       );
-      lastRateLimitError = stalled
+      lastTransportError = stalled
         ? `No response within ${Math.round(slice / 1000)}s`
         : err?.message || 'Network error';
       continue;
@@ -163,14 +168,37 @@ export async function groqChatCompletion(body, { userApiKey } = {}) {
     };
   }
 
-  console.error(
-    `[WanderForge] All ${keys.length} Groq key(s) failed. Last error: ${lastRateLimitError || 'unknown'}`
-  );
+  // Report what actually went wrong. Quota exhaustion means wait or add a key;
+  // a transport failure means try again. Saying "rate limit" for both sent people
+  // looking for the wrong fix.
+  if (lastRateLimitError && !lastTransportError) {
+    console.error(`[WanderForge] All ${keys.length} Groq key(s) rate-limited. ${lastRateLimitError}`);
+    return {
+      ok: false,
+      status: 429,
+      exhausted: true,
+      error: `All ${keys.length} Groq key${keys.length === 1 ? '' : 's'} have hit their rate limit. ${lastRateLimitError}`.trim(),
+    };
+  }
 
+  if (lastTransportError && !lastRateLimitError) {
+    console.error(`[WanderForge] Could not reach Groq on any key. ${lastTransportError}`);
+    return {
+      ok: false,
+      status: 503,
+      unreachable: true,
+      error: `Could not reach the AI provider: ${lastTransportError}. Please try again.`,
+    };
+  }
+
+  console.error(
+    `[WanderForge] All ${keys.length} Groq key(s) failed. Rate limit: ${lastRateLimitError || 'none'}; transport: ${lastTransportError || 'none'}`
+  );
   return {
     ok: false,
-    status: 429,
-    exhausted: true,
-    error: `All ${keys.length} Groq keys have hit their rate limit. ${lastRateLimitError || ''}`.trim(),
+    status: 503,
+    exhausted: Boolean(lastRateLimitError),
+    unreachable: Boolean(lastTransportError),
+    error: `The AI provider could not be used. ${[lastRateLimitError, lastTransportError].filter(Boolean).join('; ')}`.trim(),
   };
 }

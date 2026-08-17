@@ -15,6 +15,59 @@ const EPSILON = 0.01;
 const round = (n) => Math.round(n * 100) / 100;
 
 /**
+ * Balances and transfers are computed in integer cents, not decimals.
+ *
+ * Working in decimals meant the settle-up list did not actually settle. A
+ * property test over generated expense sets found a member whose balance said
+ * they owed 323.55 while the transfers moved 323.53. Three separate leaks, all
+ * bounded by a cent and all able to compound across pairings: a transfer of a
+ * cent or less was skipped while the running ledger was still decremented, the
+ * emitted amount was rounded but the ledger was not, and a residual under a cent
+ * was abandoned when moving to the next debtor.
+ *
+ * Integers remove all three. Cents are exact, so "does this reconcile?" has a
+ * yes/no answer instead of a tolerance.
+ */
+const toCents = (n) => Math.round((Number(n) || 0) * 100);
+const fromCents = (c) => c / 100;
+
+/**
+ * One expense's shares as integer cents that sum to the amount exactly.
+ *
+ * sharesFor works in decimals and legitimately returns repeating values — an
+ * equal three-way split of 100 gives 33.333… each. Rounding those independently
+ * loses or gains a cent, so the remainder is handed out by largest fractional
+ * part: the people rounded down hardest get the spare cents. Deterministic, and
+ * the total always lands on the amount.
+ */
+function shareCents(expense) {
+  const shares = sharesFor(expense);
+  const ids = Object.keys(shares);
+  if (ids.length === 0) return {};
+
+  const totalCents = toCents(expense?.amount);
+  const parts = ids.map((id) => {
+    const exact = shares[id] * 100;
+    return { id, cents: Math.floor(exact), fraction: exact - Math.floor(exact) };
+  });
+
+  let remainder = totalCents - parts.reduce((s, p) => s + p.cents, 0);
+
+  // Largest fractional part first, then by id so the result never depends on
+  // object key order.
+  parts.sort((a, b) => b.fraction - a.fraction || (a.id < b.id ? -1 : 1));
+
+  for (let k = 0; remainder > 0 && parts.length > 0; k++, remainder--) {
+    parts[k % parts.length].cents += 1;
+  }
+  for (let k = 0; remainder < 0 && parts.length > 0; k++, remainder++) {
+    parts[parts.length - 1 - (k % parts.length)].cents -= 1;
+  }
+
+  return Object.fromEntries(parts.map((p) => [p.id, p.cents]));
+}
+
+/**
  * What each person owes for one expense, as { userId: amount }.
  *
  * An expense either carries explicit `shares` (an unequal split entered by the
@@ -93,30 +146,43 @@ export function sharesFor(expense) {
  * @returns { [userId]: { paid, owed, net } }  net > 0 means the group owes them.
  */
 export function computeBalances(expenses = [], memberIds = []) {
-  const balances = {};
-  const ensure = (id) => (balances[id] ??= { paid: 0, owed: 0, net: 0 });
+  // Accumulated in cents so the totals are exact; converted back on the way out
+  // because every caller and every stored value speaks decimals.
+  const cents = {};
+  const ensure = (id) => (cents[id] ??= { paid: 0, owed: 0 });
 
   memberIds.forEach(ensure);
 
   for (const e of expenses) {
-    const amount = Number(e.amount) || 0;
-    const shares = sharesFor(e);
-    if (!amount || !e.paid_by || Object.keys(shares).length === 0) continue;
+    const amountCents = toCents(e?.amount);
+    const shares = shareCents(e);
+    if (!amountCents || !e.paid_by || Object.keys(shares).length === 0) continue;
 
-    ensure(e.paid_by).paid += amount;
+    ensure(e.paid_by).paid += amountCents;
     for (const [userId, owed] of Object.entries(shares)) {
       ensure(userId).owed += owed;
     }
   }
 
-  for (const id of Object.keys(balances)) {
-    const b = balances[id];
-    b.paid = round(b.paid);
-    b.owed = round(b.owed);
-    b.net = round(b.paid - b.owed);
+  const balances = {};
+  for (const id of Object.keys(cents)) {
+    const c = cents[id];
+    balances[id] = {
+      paid: fromCents(c.paid),
+      owed: fromCents(c.owed),
+      net: fromCents(c.paid - c.owed),
+    };
   }
 
   return balances;
+}
+
+/** Per-person net in integer cents. Internal to the settlement functions. */
+function netCents(expenses, memberIds) {
+  const balances = computeBalances(expenses, memberIds);
+  return Object.fromEntries(
+    Object.entries(balances).map(([id, b]) => [id, toCents(b.net)])
+  );
 }
 
 /**
@@ -125,14 +191,14 @@ export function computeBalances(expenses = [], memberIds = []) {
  * opposing debts at once.
  */
 export function detailedSettlements(expenses = []) {
-  const pairs = new Map(); // "debtor->creditor" -> amount
+  const pairs = new Map(); // "debtor->creditor" -> cents
 
   for (const e of expenses) {
     if (!e.paid_by) continue;
-    for (const [userId, owed] of Object.entries(sharesFor(e))) {
-      if (userId === e.paid_by || owed <= 0) continue;
+    for (const [userId, owedCents] of Object.entries(shareCents(e))) {
+      if (userId === e.paid_by || owedCents <= 0) continue;
       const key = `${userId}->${e.paid_by}`;
-      pairs.set(key, (pairs.get(key) || 0) + owed);
+      pairs.set(key, (pairs.get(key) || 0) + owedCents);
     }
   }
 
@@ -149,13 +215,15 @@ export function detailedSettlements(expenses = []) {
     seen.add(key);
     seen.add(reverseKey);
 
-    const netAmount = amount - reverse;
-    if (Math.abs(netAmount) < EPSILON) continue;
+    // Cents, so an exactly-offsetting pair is exactly zero. A tolerance here
+    // would silently drop up to a cent of real debt.
+    const netCentsForPair = amount - reverse;
+    if (netCentsForPair === 0) continue;
 
     result.push(
-      netAmount > 0
-        ? { from, to, amount: round(netAmount) }
-        : { from: to, to: from, amount: round(-netAmount) }
+      netCentsForPair > 0
+        ? { from, to, amount: fromCents(netCentsForPair) }
+        : { from: to, to: from, amount: fromCents(-netCentsForPair) }
     );
   }
 
@@ -170,36 +238,43 @@ export function detailedSettlements(expenses = []) {
  * and in practice produces the minimum for realistic group sizes.
  */
 export function simplifiedSettlements(expenses = [], memberIds = []) {
-  const balances = computeBalances(expenses, memberIds);
+  const nets = netCents(expenses, memberIds);
 
   const debtors = [];   // owe money  (net < 0)
   const creditors = []; // are owed   (net > 0)
 
-  for (const [id, b] of Object.entries(balances)) {
-    if (b.net < -EPSILON) debtors.push({ id, amount: -b.net });
-    else if (b.net > EPSILON) creditors.push({ id, amount: b.net });
+  for (const [id, net] of Object.entries(nets)) {
+    if (net < 0) debtors.push({ id, cents: -net });
+    else if (net > 0) creditors.push({ id, cents: net });
   }
 
-  // Largest first, so big debts are cleared in single transfers.
-  debtors.sort((a, b) => b.amount - a.amount);
-  creditors.sort((a, b) => b.amount - a.amount);
+  // Largest first, so big debts are cleared in single transfers. Tie-break on id
+  // so the output is stable rather than dependent on object key order.
+  debtors.sort((a, b) => b.cents - a.cents || (a.id < b.id ? -1 : 1));
+  creditors.sort((a, b) => b.cents - a.cents || (a.id < b.id ? -1 : 1));
 
   const transfers = [];
   let i = 0;
   let j = 0;
 
   while (i < debtors.length && j < creditors.length) {
-    const pay = Math.min(debtors[i].amount, creditors[j].amount);
+    const pay = Math.min(debtors[i].cents, creditors[j].cents);
 
-    if (pay > EPSILON) {
-      transfers.push({ from: debtors[i].id, to: creditors[j].id, amount: round(pay) });
+    // Every cent is emitted. Skipping a small transfer while still decrementing
+    // the ledger is what left members short of their stated balance.
+    if (pay > 0) {
+      transfers.push({
+        from: debtors[i].id,
+        to: creditors[j].id,
+        amount: fromCents(pay),
+      });
     }
 
-    debtors[i].amount -= pay;
-    creditors[j].amount -= pay;
+    debtors[i].cents -= pay;
+    creditors[j].cents -= pay;
 
-    if (debtors[i].amount < EPSILON) i++;
-    if (creditors[j].amount < EPSILON) j++;
+    if (debtors[i].cents === 0) i++;
+    if (creditors[j].cents === 0) j++;
   }
 
   return transfers.sort((a, b) => b.amount - a.amount);
