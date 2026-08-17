@@ -279,7 +279,7 @@ export default function ExpenseSplitPanel({ tripId, trip, collaborators = [], is
             {/* Summary */}
             <div className="split__summary">
               <div>
-                <span className="split__total">{formatMoney(total, currency)}</span>
+                <span className="split__total">{formatMoney(total, currency, { decimals: 2 })}</span>
                 <span className="split__muted"> across {expenses.length} expense{expenses.length === 1 ? '' : 's'}</span>
               </div>
               <Button variant="primary" size="sm" onClick={openAdd}>+ Add Expense</Button>
@@ -306,13 +306,13 @@ export default function ExpenseSplitPanel({ tripId, trip, collaborators = [], is
                       <span className="bal-row__name">
                         {nameOf(m)}{m.user_id === user?.id ? ' (you)' : ''}
                       </span>
-                      <span className="split__muted">paid {formatMoney(b.paid, currency)}</span>
+                      <span className="split__muted">paid {formatMoney(b.paid, currency, { decimals: 2 })}</span>
                       <span className={`bal-row__net bal-row__net--${state}`}>
                         {state === 'even'
                           ? 'settled up'
                           : state === 'positive'
-                            ? `gets back ${formatMoney(b.net, currency)}`
-                            : `owes ${formatMoney(-b.net, currency)}`}
+                            ? `gets back ${formatMoney(b.net, currency, { decimals: 2 })}`
+                            : `owes ${formatMoney(-b.net, currency, { decimals: 2 })}`}
                       </span>
                     </div>
                   );
@@ -345,7 +345,7 @@ export default function ExpenseSplitPanel({ tripId, trip, collaborators = [], is
                       <span className="transfer__from">{label(t.from)}</span>
                       <span className="transfer__arrow">pays →</span>
                       <span className="transfer__to">{label(t.to)}</span>
-                      <span className="transfer__amount">{formatMoney(t.amount, currency)}</span>
+                      <span className="transfer__amount">{formatMoney(t.amount, currency, { decimals: 2 })}</span>
                     </div>
                   ))}
                 </div>
@@ -368,7 +368,7 @@ export default function ExpenseSplitPanel({ tripId, trip, collaborators = [], is
                           {e.split_mode && e.split_mode !== 'equal' ? ' · unequal' : ' · equal'}
                         </span>
                       </div>
-                      <span className="exp__amount">{formatMoney(e.amount, e.currency || currency)}</span>
+                      <span className="exp__amount">{formatMoney(e.amount, e.currency || currency, { decimals: 2 })}</span>
                       {(e.created_by === user?.id || trip?.user_id === user?.id) && (
                         <button className="exp__del" onClick={() => deleteExpense(e.id)} title="Remove">✕</button>
                       )}
