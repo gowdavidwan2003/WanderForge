@@ -21,6 +21,7 @@ import { formatMoney, inferCurrency } from '@/lib/currency';
 import NearbyPlacesPanel from '@/components/trip/NearbyPlacesPanel';
 import BookingsPanel from '@/components/trip/BookingsPanel';
 import { bookingsTotal } from '@/lib/bookings';
+import { clearsExistingActivities, orderOffsetFor, planGeneration } from '@/lib/generationGuard';
 import { replanDay } from '@/lib/replanDay';
 
 const CATEGORY_CONFIG = {
@@ -518,10 +519,12 @@ export default function TripEditorPage({ params }) {
     setAiProgress({ phase: 'planning', done: 0, total: 0 });
 
     try {
-      if (mode === 'replace') {
+      if (clearsExistingActivities(mode)) {
         const dayIds = days.map((d) => d.id);
         if (dayIds.length) {
           const { error } = await supabase.from('activities').delete().in('trip_day_id', dayIds);
+          // Abort rather than generate: a failed clear followed by a successful
+          // insert reproduces exactly the duplication this guard exists to stop.
           if (error) throw new Error(`Could not clear the old itinerary: ${error.message}`);
         }
       }
@@ -551,7 +554,7 @@ export default function TripEditorPage({ params }) {
         const day = days.find((d) => d.day_number === dayPlan.day);
         if (!day) continue;
         // Appending must not reuse order_index values already on the day.
-        const offset = mode === 'append' ? (activities[day.id]?.length || 0) : 0;
+        const offset = orderOffsetFor(mode, activities[day.id]?.length || 0);
         written += await insertDayPlan(day, dayPlan, data.currency, offset);
       }
 
@@ -572,16 +575,23 @@ export default function TripEditorPage({ params }) {
   };
 
   const handleAIGenerate = () => {
-    if (blockedByLock() || !trip) return;
-    if (generatingRef.current) return;
+    if (!trip) return;
+    // blockedByLock() also raises a toast explaining why, so call it first.
+    if (blockedByLock()) return;
 
-    const existing = Object.values(activities).flat().length;
-    if (existing > 0) {
-      setPendingGenerate({ existing });
+    const decision = planGeneration({
+      existingCount: Object.values(activities).flat().length,
+      inFlight: generatingRef.current,
+      locked: isLocked,
+    });
+
+    if (decision.action === 'ignore') return;
+    if (decision.action === 'confirm') {
+      setPendingGenerate({ existing: decision.existing });
       return;
     }
 
-    runGenerate('replace');
+    runGenerate(decision.mode);
   };
 
   /**
