@@ -522,16 +522,6 @@ export default function TripEditorPage({ params }) {
     setAiProgress({ phase: 'planning', done: 0, total: 0 });
 
     try {
-      if (clearsExistingActivities(mode)) {
-        const dayIds = days.map((d) => d.id);
-        if (dayIds.length) {
-          const { error } = await supabase.from('activities').delete().in('trip_day_id', dayIds);
-          // Abort rather than generate: a failed clear followed by a successful
-          // insert reproduces exactly the duplication this guard exists to stop.
-          if (error) throw new Error(`Could not clear the old itinerary: ${error.message}`);
-        }
-      }
-
       const res = await fetch('/api/ai/generate', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
@@ -550,6 +540,22 @@ export default function TripEditorPage({ params }) {
       if (!data.itinerary) throw new Error('No itinerary returned');
 
       const total = data.itinerary.reduce((s, d) => s + (d.activities?.length || 0), 0);
+      if (total === 0) throw new Error('The AI returned an itinerary with no activities.');
+
+      // Only now is it safe to clear. Deleting before this point meant a Groq
+      // rate limit — the likeliest failure on a free-tier key — wiped the
+      // itinerary and left nothing to replace it, which is the same
+      // delete-before-you-can-restore mistake replanDay makes.
+      if (clearsExistingActivities(mode)) {
+        const dayIds = days.map((d) => d.id);
+        if (dayIds.length) {
+          const { error } = await supabase.from('activities').delete().in('trip_day_id', dayIds);
+          // Abort rather than insert: a failed clear followed by a successful
+          // insert reproduces exactly the duplication this guard exists to stop.
+          if (error) throw new Error(`Could not clear the old itinerary: ${error.message}`);
+        }
+      }
+
       setAiProgress({ phase: 'saving', done: 0, total });
 
       let written = 0;

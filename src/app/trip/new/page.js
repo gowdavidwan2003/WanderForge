@@ -7,6 +7,7 @@ import { useToast } from '@/components/ui/Toast';
 import { getSupabaseBrowserClient } from '@/lib/supabase/client';
 import { withTimeout } from '@/lib/withTimeout';
 import { CURRENCIES, inferCurrency, currencySymbol } from '@/lib/currency';
+import { MAX_TRIP_DAYS, exceedsDayLimit, tripDayCount } from '@/lib/tripLimits';
 import Button from '@/components/ui/Button';
 import Input from '@/components/ui/Input';
 
@@ -88,12 +89,10 @@ export default function NewTripPage() {
     }
   };
 
-  const getDayCount = () => {
-    if (!formData.startDate || !formData.endDate) return 0;
-    const start = new Date(formData.startDate);
-    const end = new Date(formData.endDate);
-    return Math.max(1, Math.ceil((end - start) / (1000 * 60 * 60 * 24)) + 1);
-  };
+  // Clamped: this number drives one AI day and one billed geocode per activity,
+  // so an unbounded range was an unbounded bill.
+  const getDayCount = () => tripDayCount(formData.startDate, formData.endDate);
+  const tooManyDays = exceedsDayLimit(formData.startDate, formData.endDate);
 
   const handleCreate = async () => {
     if (!user) {
@@ -107,6 +106,17 @@ export default function NewTripPage() {
     }
     if (!formData.startDate || !formData.endDate) {
       toast.error('Please select travel dates');
+      return;
+    }
+    if (new Date(formData.endDate) < new Date(formData.startDate)) {
+      toast.error('The end date is before the start date');
+      return;
+    }
+    if (tooManyDays) {
+      toast.error(
+        `Trips are limited to ${MAX_TRIP_DAYS} days. Split a longer journey into separate trips.`,
+        'Too long to plan'
+      );
       return;
     }
 

@@ -1,6 +1,7 @@
 import { NextResponse } from 'next/server';
 import { groqChatCompletion } from '@/lib/groq';
 import { REALISM_RULES, preferencesBlock } from '@/lib/itineraryPrompt';
+import { requireUser } from '@/lib/api/requireUser';
 
 /**
  * Re-plan a whole trip while preserving every place already on it.
@@ -14,7 +15,17 @@ import { REALISM_RULES, preferencesBlock } from '@/lib/itineraryPrompt';
  * the result. Times, ordering and day assignment are free to change; the set of
  * places is not.
  */
+// Groq can sit on a connection well past a serverless default. Declaring the
+// ceiling makes the timeout ours to control rather than the platform's, and
+// groq.js budgets its own attempts against this number.
+export const maxDuration = 60;
+
 export async function POST(request) {
+  // These routes spend the operator's Google and Groq quota, so they must
+  // not be callable anonymously.
+  const auth = await requireUser();
+  if (auth.error) return auth.error;
+
   try {
     const {
       destination,
