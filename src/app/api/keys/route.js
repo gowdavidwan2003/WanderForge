@@ -1,6 +1,6 @@
 import { NextResponse } from 'next/server';
 import { requireUser } from '@/lib/api/requireUser';
-import { getSupabaseServerClient } from '@/lib/supabase/server';
+import { getSupabaseAdminClient, getSupabaseServerClient } from '@/lib/supabase/server';
 import {
   encryptSecret,
   encryptionAvailable,
@@ -19,9 +19,26 @@ import {
  *
  * The full key is write-only from the client's perspective. It goes in, and only
  * a masked hint ever comes back.
+ *
+ * Writes use the service role, and reads of the ciphertext do too. Migration 013
+ * revokes every write on this table from `authenticated` and grants SELECT on
+ * only the non-secret columns, precisely so a browser cannot store an unencrypted
+ * key or read an encrypted one. That revoke also applies to the request-scoped
+ * server client, which acts as `authenticated` — so anything here touching the
+ * secret has to be the service role.
+ *
+ * The service role bypasses RLS, which means the scoping is this file's
+ * responsibility: every query below filters on auth.user.id, taken from the
+ * verified session and never from the request body.
  */
 
 const PROVIDERS = ['groq'];
+
+/** The privileged client, or null when the deployment has not configured one. */
+async function adminClient() {
+  if (!process.env.SUPABASE_SERVICE_ROLE_KEY) return null;
+  return getSupabaseAdminClient();
+}
 
 /** Rough shape check, so an obvious paste error is caught before it is stored. */
 function looksLikeGroqKey(key) {
@@ -32,6 +49,9 @@ export async function GET() {
   const auth = await requireUser();
   if (auth.error) return auth.error;
 
+  // The user's own client on purpose: these columns are granted to
+  // `authenticated` and RLS scopes the rows, so no privilege escalation is
+  // needed to list your own keys.
   const supabase = await getSupabaseServerClient();
   const { data, error } = await supabase
     // Deliberately not selecting encrypted_key. Nothing on this route has a
@@ -85,7 +105,15 @@ export async function POST(request) {
       throw new Error('Encryption produced an unexpected format');
     }
 
-    const supabase = await getSupabaseServerClient();
+    const supabase = await adminClient();
+    if (!supabase) {
+      console.error('[WanderForge] SUPABASE_SERVICE_ROLE_KEY is missing; cannot store an API key.');
+      return NextResponse.json(
+        { error: 'Key storage is not configured on this server. Nothing was saved.' },
+        { status: 503 }
+      );
+    }
+
     const { error } = await supabase.from('user_api_keys').upsert(
       {
         user_id: auth.user.id,
@@ -115,10 +143,15 @@ export async function DELETE(request) {
     return NextResponse.json({ error: 'Unsupported provider' }, { status: 400 });
   }
 
-  const supabase = await getSupabaseServerClient();
+  const supabase = await adminClient();
+  if (!supabase) {
+    return NextResponse.json({ error: 'Key storage is not configured.' }, { status: 503 });
+  }
+
   const { error } = await supabase
     .from('user_api_keys')
     .delete()
+    // Scoped here, because the service role bypasses RLS.
     .eq('user_id', auth.user.id)
     .eq('provider', provider);
 
