@@ -36,6 +36,7 @@ import {
   shapeTripPayload,
 } from '@/lib/realtimeState';
 import { fetchWeather as loadWeather } from '@/lib/weatherCache';
+import TripSettingsPanel from '@/components/trip/TripSettingsPanel';
 
 const CATEGORY_CONFIG = {
   sightseeing: { icon: '🏛️', color: '#6366F1', label: 'Sightseeing' },
@@ -76,6 +77,9 @@ export default function TripEditorPage({ params }) {
   const [locating, setLocating] = useState(null);
   const [showNearby, setShowNearby] = useState(false);
   const [showBookings, setShowBookings] = useState(false);
+  const [showSettings, setShowSettings] = useState(false);
+  const [savingTrip, setSavingTrip] = useState(false);
+  const [deletingTrip, setDeletingTrip] = useState(false);
   // The day_number currently being rebuilt, or null. A number rather than a
   // boolean so the panel can show the spinner on the day it belongs to.
   const [replanningDay, setReplanningDay] = useState(null);
@@ -339,6 +343,70 @@ export default function TripEditorPage({ params }) {
    * broken day before you may fix it is exactly the friction the panel exists to
    * remove.
    */
+  /**
+   * Save an edited trip.
+   *
+   * The day list is reconciled in the same transaction as the trip fields, so a
+   * trip can never end up with days that disagree with its own dates. The panel
+   * has already shown the user what removing days costs.
+   */
+  const handleSaveTrip = async ({ form, plan }) => {
+    setSavingTrip(true);
+    try {
+      const { data, error } = await withTimeout(
+        supabase.rpc('update_trip_with_days', {
+          p_trip_id: id,
+          p_trip: {
+            title: form.title.trim(),
+            destination: form.destination.trim(),
+            start_date: form.startDate,
+            end_date: form.endDate,
+            transport_mode: form.transportMode,
+            // Present-but-empty clears it; the RPC distinguishes that from absent.
+            total_budget: form.totalBudget === '' ? null : String(form.totalBudget),
+          },
+          p_days: plan.days,
+        }),
+        'Saving your trip'
+      );
+      if (error) throw error;
+
+      setTrip((prev) => ({ ...prev, ...data }));
+      setShowSettings(false);
+      toast.success(
+        plan.removed.length
+          ? `Saved. ${plan.removed.length} day(s) outside the new dates were removed.`
+          : 'Your trip has been updated.',
+        'Trip Saved'
+      );
+      // Days changed shape, so this one does need a re-read — the RPC returns the
+      // trip row, not the reconciled day list.
+      fetchTripData();
+    } catch (err) {
+      toast.error(err.message || 'Could not save the trip', 'Save failed');
+    } finally {
+      setSavingTrip(false);
+    }
+  };
+
+  /** Delete the trip. Everything below it cascades in Postgres. */
+  const handleDeleteTrip = async () => {
+    setDeletingTrip(true);
+    try {
+      const { error } = await withTimeout(
+        supabase.from('trips').delete().eq('id', id),
+        'Deleting your trip'
+      );
+      if (error) throw error;
+
+      toast.success('The trip and everything on it has been deleted.', 'Trip Deleted');
+      router.push('/dashboard');
+    } catch (err) {
+      toast.error(err.message || 'Could not delete the trip', 'Delete failed');
+      setDeletingTrip(false);
+    }
+  };
+
   const handleReplanDay = async (day = selectedDay) => {
     if (blockedByLock() || !day) return;
     setReplanningDay(day.day_number);
@@ -990,6 +1058,13 @@ export default function TripEditorPage({ params }) {
                       : 'Freeze the itinerary so nobody can change it',
                   },
                   {
+                    key: 'settings',
+                    label: 'Trip Settings',
+                    icon: '⚙️',
+                    onClick: () => setShowSettings(true),
+                    title: 'Edit the title, dates, destination, budget or transport — or delete the trip',
+                  },
+                  {
                     key: 'nearby',
                     label: 'Find Nearby',
                     icon: '🧭',
@@ -1377,6 +1452,24 @@ export default function TripEditorPage({ params }) {
         isOpen={showExpenses}
         onClose={() => setShowExpenses(false)}
       />
+
+      {/* Mounted only while open, so the form re-seeds from the trip each time
+          rather than needing an effect to reset it. */}
+      {showSettings && (
+      <TripSettingsPanel
+        isOpen={showSettings}
+        onClose={() => setShowSettings(false)}
+        trip={trip}
+        days={days}
+        activities={activities}
+        onSave={handleSaveTrip}
+        onDelete={handleDeleteTrip}
+        saving={savingTrip}
+        deleting={deletingTrip}
+        // Editors may change a trip; only the owner may destroy it.
+        canDelete={isOwner}
+      />
+      )}
 
       <ConflictCheckPanel
         isOpen={showConflicts}
