@@ -1,4 +1,4 @@
-import { getSupabaseServerClient } from '@/lib/supabase/server';
+import { getSupabaseAdminClient, getSupabaseServerClient } from '@/lib/supabase/server';
 import { decryptSecret } from '@/lib/serverCrypto';
 
 /**
@@ -27,12 +27,20 @@ import { decryptSecret } from '@/lib/serverCrypto';
  */
 export async function getUserGroqKey() {
   try {
+    // Identify the caller with their own client, so the user id comes from a
+    // verified session rather than from anything the caller controls.
     const supabase = await getSupabaseServerClient();
-
     const { data: { user } } = await supabase.auth.getUser();
     if (!user) return undefined;
 
-    const { data, error } = await supabase
+    // Read the ciphertext with the service role. Migration 013 grants
+    // `authenticated` SELECT on the non-secret columns only, so the user's own
+    // client cannot read this one — which is the point of the grant, and means
+    // the scoping below is this function's responsibility rather than RLS's.
+    if (!process.env.SUPABASE_SERVICE_ROLE_KEY) return undefined;
+    const admin = await getSupabaseAdminClient();
+
+    const { data, error } = await admin
       .from('user_api_keys')
       .select('encrypted_key')
       .eq('user_id', user.id)
