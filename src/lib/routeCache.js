@@ -11,6 +11,8 @@
  * everybody and it does not change often.
  */
 
+import { reportError, reportWarning } from '@/lib/observability';
+
 /** Google Maps Platform terms: cached content expires after 30 days. */
 export const CACHE_TTL_DAYS = 30;
 export const CACHE_TTL_MS = CACHE_TTL_DAYS * 24 * 60 * 60 * 1000;
@@ -118,7 +120,9 @@ export async function readCache(supabase, keys, now = Date.now()) {
       .in('cache_key', keys);
 
     if (error) {
-      console.warn('[WanderForge] Route cache unreadable, falling back to estimates:', error.message);
+      // Falling back to estimates means the checker quietly gets worse at the
+      // one thing it is for.
+      reportWarning(error.message, 'route-cache-read', { keys: keys.length });
       return found;
     }
 
@@ -126,7 +130,7 @@ export async function readCache(supabase, keys, now = Date.now()) {
       if (isFresh(row, now)) found.set(row.cache_key, row);
     }
   } catch (err) {
-    console.warn('[WanderForge] Route cache read failed:', err.message);
+    reportWarning(err.message, 'route-cache-read');
   }
 
   return found;

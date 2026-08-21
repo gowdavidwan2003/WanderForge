@@ -1,5 +1,6 @@
 import { getSupabaseAdminClient, getSupabaseServerClient } from '@/lib/supabase/server';
 import { decryptSecret } from '@/lib/serverCrypto';
+import { reportError, reportWarning } from '@/lib/observability';
 
 /**
  * The signed-in user's own Groq key, if they have saved one.
@@ -54,7 +55,7 @@ export async function getUserGroqKey() {
     // worth failing a generation over.
     return decryptSecret(data.encrypted_key) ?? undefined;
   } catch (err) {
-    console.warn('[WanderForge] Could not read the user API key:', err.message);
+    reportWarning(err.message, 'byok-lookup');
     return undefined;
   }
 }

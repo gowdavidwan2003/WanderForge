@@ -16,6 +16,8 @@
  * Server-side only. The key derivation is pure and tested; the I/O is thin.
  */
 
+import { reportError, reportWarning } from '@/lib/observability';
+
 /**
  * Google Maps Platform terms allow caching content for up to 30 days.
  *
@@ -122,7 +124,9 @@ export async function readCache(supabase, keys, now = Date.now()) {
     if (error) {
       // Most likely the migration has not been run yet. Say so once, plainly,
       // rather than silently paying Google for every lookup forever.
-      console.warn('[WanderForge] Geocode cache unreadable, falling back to Google:', error.message);
+      // Every lookup is billed while this is true, which is the whole reason
+      // the cache exists. Loud enough to notice.
+      reportWarning(error.message, 'geocode-cache-read', { keys: keys.length });
       return found;
     }
 
@@ -130,7 +134,7 @@ export async function readCache(supabase, keys, now = Date.now()) {
       if (isFresh(row, now)) found.set(row.cache_key, row);
     }
   } catch (err) {
-    console.warn('[WanderForge] Geocode cache read failed:', err.message);
+    reportWarning(err.message, 'geocode-cache-read');
   }
 
   return found;
@@ -153,7 +157,7 @@ export async function writeCache(admin, rows) {
       .upsert(rows, { onConflict: 'cache_key' });
 
     if (error) {
-      console.warn('[WanderForge] Geocode cache write failed:', error.message);
+      reportWarning(error.message, 'geocode-cache-write');
       return 0;
     }
     return rows.length;

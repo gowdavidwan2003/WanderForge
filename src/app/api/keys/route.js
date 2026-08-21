@@ -7,6 +7,7 @@ import {
   isEncrypted,
   maskSecret,
 } from '@/lib/serverCrypto';
+import { reportError, reportWarning } from '@/lib/observability';
 
 /**
  * Storing and clearing a user's own API key.
@@ -129,7 +130,8 @@ export async function POST(request) {
     return NextResponse.json({ ok: true, provider, key_hint: maskSecret(trimmed) });
   } catch (err) {
     // Never echo the request body back in an error. It contains the key.
-    console.error('[WanderForge] Failed to store an API key:', err.message);
+    // Deliberately without a context object: it would contain the key.
+    reportError(err, 'api/keys-store');
     return NextResponse.json({ error: 'Could not save the key.' }, { status: 500 });
   }
 }

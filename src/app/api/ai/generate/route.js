@@ -27,6 +27,7 @@ import {
   MIN_GEOCODE_MS,
   createBudget,
 } from '@/lib/aiBudget';
+import { reportError, reportWarning } from '@/lib/observability';
 
 // Groq can sit on a connection well past a serverless default. Declaring the
 // ceiling makes the timeout ours to control rather than the platform's, and
@@ -373,7 +374,7 @@ function streamItinerary({ messages, days, budget, userApiKey, near, transportMo
         }
       } catch (err) {
         if (!upstream.signal.aborted) {
-          console.error('AI Streaming Error:', err);
+          reportError(err, 'ai/generate-stream', { days });
           send('error', { message: err.message || 'Failed to generate itinerary' });
         }
       } finally {
@@ -510,7 +511,8 @@ ${FORMAT_BLOCK}`;
     // than silently becoming somebody's Tuesday.
     return NextResponse.json(finished.payload);
   } catch (err) {
-    console.error('AI Generation Error:', err);
+    // The user gets a toast and moves on; without this nobody ever finds out.
+    reportError(err, 'ai/generate', { streaming: false });
     return NextResponse.json(
       { error: err.message || 'Failed to generate itinerary' },
       { status: 500 }

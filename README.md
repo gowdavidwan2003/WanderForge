@@ -198,6 +198,30 @@ about.
 npm run dev
 ```
 
+### Optional: error reporting
+
+Several of the most important failure paths here are deliberately silent to the
+user — a cache falling back, a road leg timing out, a saved API key failing to
+decrypt. Silent to the user is correct; silent to you is how a broken deploy runs
+for a week.
+
+Set these and those failures start reporting to Sentry. Leave them unset and
+every reporting call is a no-op, which is why a fork needs no account:
+
+```bash
+SENTRY_DSN=<server dsn>
+NEXT_PUBLIC_SENTRY_DSN=<same dsn, public by design>
+# Only needed in the deploy environment, for source-map upload
+SENTRY_AUTH_TOKEN=<token>
+SENTRY_ORG=<org>
+SENTRY_PROJECT=<project>
+```
+
+Trip content never leaves the application: `scrub()` in
+[`observability.js`](src/lib/observability.js) redacts notes, itineraries, chat
+messages, emails and every credential before anything is sent, and request bodies
+and cookies are dropped entirely.
+
 ---
 
 ## Architecture
@@ -248,6 +272,12 @@ npm test          # once
 npm run test:watch
 ```
 
+Every push and pull request runs the suite, the linter and a production build
+via [`.github/workflows/ci.yml`](.github/workflows/ci.yml). It builds with
+deliberately fake Supabase credentials pointing at a domain that resolves to
+nothing, so a bug that tries to reach a real service during a build fails loudly
+rather than quietly touching a live project.
+
 Vitest, Node environment, no jsdom — everything under test is pure logic. The
 suite covers the output contract against real model misbehaviour, the conflict
 checker's arithmetic, settlement (including a property test), the streaming
@@ -260,6 +290,14 @@ editing.
 
 Working end to end. Not audited, not load-tested, and not run against a real user
 base.
+
+### Knowing whether it works
+
+[`supabase/verify/product_metrics.sql`](supabase/verify/product_metrics.sql) is
+two read-only queries that need no analytics vendor, because the data is already
+there. The first answers whether the conflict checker is actually firing and what
+the caches are costing you; the second is a rough retention curve from
+`auth.users`. Worth running before deciding what to build next.
 
 **Known gaps**
 
@@ -276,6 +314,14 @@ base.
   writes.
 - No automated accessibility testing. The manual pass covered focus management,
   keyboard reordering, contrast and reduced motion.
+- No product analytics. The SQL above is a floor, not a substitute:
+  `trips.conflicts` is overwritten on each regeneration, so it counts trips that
+  have been generated rather than generations.
+- Collaboration invitations create a database row and send no email. The invitee
+  sees them on their dashboard when they next sign in. Supabase Auth's own
+  emails (confirmation, password reset) do send if SMTP is configured.
+- No staging environment. Migrations have been applied directly to production,
+  including two that delete rows.
 
 ---
 

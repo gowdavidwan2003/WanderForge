@@ -1,0 +1,67 @@
+name: CI
+
+# Every push and every pull request. The point is that nobody has to remember:
+# 477 tests that only run when somebody types `npm test` are 477 tests that stop
+# running the first busy week.
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+# A second push to the same PR cancels the first run rather than queueing behind
+# it. Nobody needs the results for a commit that has already been replaced.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    env:
+      # Deliberately fake, and deliberately well-formed.
+      #
+      # `next build` collects page data for the API routes, which construct a
+      # Supabase client at module load — without a URL it fails with
+      # "supabaseUrl is required" before any of our code runs. These satisfy that
+      # and point at a domain that resolves to nothing, so a bug that tries to
+      # reach out during a build fails loudly in CI rather than quietly touching
+      # a real project.
+      #
+      # No real secret belongs here. Nothing in this workflow needs one: the
+      # tests are pure and the build never calls an API.
+      NEXT_PUBLIC_SUPABASE_URL: https://ci.invalid
+      NEXT_PUBLIC_SUPABASE_ANON_KEY: ci-not-a-real-key
+      SUPABASE_SERVICE_ROLE_KEY: ci-not-a-real-key
+      NEXT_PUBLIC_APP_URL: http://localhost:3000
+      # 32 characters, which is serverCrypto's minimum. Its tests set their own.
+      ENCRYPTION_SECRET: ci-placeholder-secret-000000000000
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+
+      # `npm ci` rather than `npm install`: it installs exactly the lockfile and
+      # fails if package.json and package-lock.json disagree, which is a real
+      # failure worth catching rather than silently resolving.
+      - name: Install
+        run: npm ci
+
+      # Tests first. They are the fastest signal and the most likely to fail, so
+      # a broken push gets its answer in under a minute.
+      - name: Tests
+        run: npm test
+
+      - name: Lint
+        run: npm run lint
+
+      # Last because it is the slowest. It catches a class the others cannot: an
+      # import that resolves in Vitest but not in a Next build, a server
+      # component importing something client-only, a missing export.
+      - name: Build
+        run: npm run build
