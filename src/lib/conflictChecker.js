@@ -26,6 +26,27 @@ const OVERHEAD_MIN = { walking: 0, bike: 5, public_transit: 8, car: 12, flight: 
 const SEVERITY_RANK = { error: 0, warning: 1, info: 2 };
 
 /**
+ * How a road leg is looked up.
+ *
+ * Coordinates, not activity ids. Ids are not stable across the boundary that
+ * matters: the generate route measures a plan whose activities have no database
+ * ids yet, and the editor needs the same legs after they have been inserted with
+ * real ones. Rounding to ~110 m is what lets one measured leg serve both, and
+ * survive a replan that rewrites every id on the day.
+ *
+ * Kept in step with legKey() in routeCache.js — same rounding, same format.
+ */
+const ROAD_KEY_PRECISION = 3;
+
+export function roadLegKey(from, to) {
+  const n = (v) => Number(v).toFixed(ROAD_KEY_PRECISION);
+  if (![from?.latitude, from?.longitude, to?.latitude, to?.longitude].every(Number.isFinite)) {
+    return null;
+  }
+  return `${n(from.latitude)},${n(from.longitude)}>${n(to.latitude)},${n(to.longitude)}`;
+}
+
+/**
  * How far short a transition may fall before it is worth mentioning.
  *
  * Every estimate here is great-circle distance times a road factor, at a fixed
@@ -121,6 +142,10 @@ const hasCoords = (a) =>
  * @param trip      the trip row (currency, total_budget, transport_mode)
  * @param days      ordered trip_days
  * @param activities { [dayId]: Activity[] }  already ordered by order_index
+ * @param roadLegs   measured legs keyed by roadLegKey(from, to). Supplying them
+ *                   activates the winding-road correction in travelMinutes; with
+ *                   an empty object every estimate is great-circle distance
+ *                   times ROAD_FACTOR, which is optimistic on mountain roads.
  * @returns { issues, summary }
  */
 export function checkItinerary(trip, days = [], activities = {}, roadLegs = {}) {
@@ -212,7 +237,9 @@ export function checkItinerary(trip, days = [], activities = {}, roadLegs = {}) 
       if (!hasCoords(prev) || !hasCoords(a)) continue;
 
       const km = haversineKm(prev.latitude, prev.longitude, a.latitude, a.longitude);
-      const leg = roadLegs[`${prev.id}->${a.id}`] || {};
+      // Was keyed on `${prev.id}->${a.id}`, which nothing could ever populate
+      // across the generate/editor boundary. See roadLegKey above.
+      const leg = roadLegs[roadLegKey(prev, a)] || {};
       const roadKm = leg.km ?? null;
       const realMinutes = leg.minutes ?? null;
       const effectiveKm = roadKm ?? km * ROAD_FACTOR;
