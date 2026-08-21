@@ -442,15 +442,29 @@ export default function TripEditorPage({ params }) {
   };
 
   // AI Generate itinerary
-  /** Write one generated day's activities, returning how many landed. */
+  /**
+   * Write one generated day's activities.
+   *
+   * @returns {{written: number, failures: string[]}} — failures are surfaced
+   *   rather than counted silently. Every value here has already been validated
+   *   against the database's own constraints server-side, so a rejected row now
+   *   means something went wrong that the traveler needs to hear about, not a
+   *   model that wrote "9am" into a TIME column.
+   */
   const insertDayPlan = async (day, dayPlan, currency, orderOffset = 0) => {
     const acts = dayPlan?.activities || [];
     let written = 0;
+    const failures = [];
 
     for (let i = 0; i < acts.length; i++) {
       const act = acts[i];
-      let lat = null, lng = null;
-      if (act.location_name) {
+      // The server geocoded these already, to check travel times before anything
+      // was written. Reusing its coordinates keeps the saved trip identical to
+      // the one that was checked, and saves a billed lookup per activity.
+      let lat = Number.isFinite(act.latitude) ? act.latitude : null;
+      let lng = Number.isFinite(act.longitude) ? act.longitude : null;
+
+      if (lat == null && act.location_name) {
         // location_name usually already carries the town; appending the
         // destination again produced queries no geocoder could match.
         const geo = await geocodeLocation(
@@ -477,11 +491,33 @@ export default function TripEditorPage({ params }) {
         longitude: lng,
       });
 
-      if (!error) written++;
+      if (error) failures.push(`${act.title}: ${error.message}`);
+      else written++;
       setAiProgress((p) => (p ? { ...p, done: p.done + 1 } : p));
     }
 
-    return written;
+    return { written, failures };
+  };
+
+  /**
+   * Record what the server's conflict check found.
+   *
+   * The check runs before the insert and most conflicts are fixed by
+   * re-prompting, but the survivors have to be visible somewhere — otherwise the
+   * traveler owns a plan that was known to be unachievable and nothing says so.
+   * Never fatal: the itinerary is already saved, and the check can be re-run.
+   */
+  const persistConflicts = async (conflicts) => {
+    if (!conflicts) return;
+
+    const { error } = await supabase
+      .from('trips')
+      .update({ conflicts, conflicts_checked_at: new Date().toISOString() })
+      .eq('id', trip.id);
+
+    if (error) {
+      console.warn('[WanderForge] Could not store the conflict check:', error.message);
+    }
   };
 
   /** Adopt the AI's local currency and backfill destination coords for weather. */
@@ -532,6 +568,12 @@ export default function TripEditorPage({ params }) {
           transportMode: trip.transport_mode,
           budgetLevel: trip.ai_preferences?.budget_level || 'moderate',
           notes: trip.ai_preferences?.notes || '',
+          // The server geocodes and conflict-checks the plan before returning
+          // it; these let it bias place lookups to the right town and judge
+          // whether a day runs over budget.
+          destLat: trip.dest_lat,
+          destLng: trip.dest_lng,
+          totalBudget: trip.total_budget,
         }),
       });
 
@@ -559,20 +601,46 @@ export default function TripEditorPage({ params }) {
       setAiProgress({ phase: 'saving', done: 0, total });
 
       let written = 0;
+      const failures = [];
       for (const dayPlan of data.itinerary) {
         const day = days.find((d) => d.day_number === dayPlan.day);
         if (!day) continue;
         // Appending must not reuse order_index values already on the day.
         const offset = orderOffsetFor(mode, activities[day.id]?.length || 0);
-        written += await insertDayPlan(day, dayPlan, data.currency, offset);
+        const result = await insertDayPlan(day, dayPlan, data.currency, offset);
+        written += result.written;
+        failures.push(...result.failures);
       }
 
       await applyTripMetadata(data);
+      await persistConflicts(data.conflicts);
 
       toast.success(
         `${data.itinerary.length} days planned, ${written} activities saved.`,
         mode === 'append' ? 'Added to your itinerary 🤖' : 'AI Itinerary Ready 🤖'
       );
+
+      // Say so rather than quietly reporting a smaller number than the user
+      // watched the progress bar count to.
+      if (failures.length) {
+        console.warn('[WanderForge] Activities rejected on insert:', failures);
+        toast.error(
+          `${failures.length} activity(s) could not be saved: ${failures[0]}`,
+          'Partly saved'
+        );
+      }
+
+      // The plan is real and editable either way, but an unachievable one must
+      // not arrive looking like a clean result.
+      const conflicts = data.conflicts;
+      if (conflicts && !conflicts.achievable) {
+        const blocking = conflicts.summary?.errors ?? 0;
+        toast.error(
+          `The check found ${blocking || conflicts.issues.length} transition(s) that will not work — open Check Itinerary to see which.`,
+          'Saved, but not fully achievable'
+        );
+      }
+
       fetchTripData();
     } catch (err) {
       toast.error(err.message, 'AI Generation Failed');
@@ -629,6 +697,9 @@ export default function TripEditorPage({ params }) {
           transportMode: trip.transport_mode,
           budgetLevel: trip.ai_preferences?.budget_level || 'moderate',
           notes: trip.ai_preferences?.notes || '',
+          destLat: trip.dest_lat,
+          destLng: trip.dest_lng,
+          totalBudget: trip.total_budget,
         }),
       });
 
@@ -640,13 +711,32 @@ export default function TripEditorPage({ params }) {
 
       setAiProgress({ phase: 'saving', done: 0, total: dayPlan.activities.length });
       const offset = activities[selectedDay.id]?.length || 0;
-      const written = await insertDayPlan(selectedDay, dayPlan, data.currency, offset);
+      const { written, failures } = await insertDayPlan(
+        selectedDay, dayPlan, data.currency, offset
+      );
       await applyTripMetadata(data);
+      // Deliberately not persisted: this checked one day, and writing it to
+      // trips.conflicts would claim the whole trip had been re-checked.
 
       toast.success(
         `Day ${selectedDay.day_number} filled with ${written} activities.`,
         dayPlan.theme || 'Day Planned 🤖'
       );
+
+      if (failures.length) {
+        console.warn('[WanderForge] Activities rejected on insert:', failures);
+        toast.error(
+          `${failures.length} activity(s) could not be saved: ${failures[0]}`,
+          'Partly saved'
+        );
+      }
+
+      if (data.conflicts && !data.conflicts.achievable) {
+        toast.error(
+          'Some transitions on this day will not work — open Check Itinerary to see which.',
+          'Filled, but not fully achievable'
+        );
+      }
       fetchTripData();
     } catch (err) {
       toast.error(err.message, 'AI Fill Failed');

@@ -69,10 +69,17 @@ function isRateLimited(status, payload) {
  * returned immediately, because retrying it on another key would fail identically
  * while burning quota.
  *
+ * @param userApiKey the caller's own BYOK key, tried first
+ * @param budgetMs   total wall clock for this call including rotation. Defaults
+ *                   to TOTAL_BUDGET_MS, which assumes the route makes one
+ *                   completion. The generate route makes up to three — a
+ *                   validation retry and a conflict re-prompt — so it passes a
+ *                   shrinking slice of its own budget and each call stays inside
+ *                   the route's maxDuration rather than each assuming it owns it.
  * @returns {{ok: true, data: object, keyIndex: number}
  *          |{ok: false, status: number, error: string, exhausted?: boolean}}
  */
-export async function groqChatCompletion(body, { userApiKey } = {}) {
+export async function groqChatCompletion(body, { userApiKey, budgetMs = TOTAL_BUDGET_MS } = {}) {
   const keys = groqKeys(userApiKey);
 
   if (keys.length === 0) {
@@ -97,10 +104,10 @@ export async function groqChatCompletion(body, { userApiKey } = {}) {
     // Budget across rotation, not per attempt: without this, four keys each
     // allowed their own timeout could outlast the route's maxDuration and the
     // platform would kill the invocation mid-flight.
-    const slice = attemptBudgetMs(Date.now() - startedAt);
+    const slice = attemptBudgetMs(Date.now() - startedAt, budgetMs);
     if (slice <= 0) {
       console.warn(
-        `[WanderForge] Groq budget of ${TOTAL_BUDGET_MS}ms exhausted after ${i} attempt(s); not trying the remaining ${keys.length - i} key(s).`
+        `[WanderForge] Groq budget of ${budgetMs}ms exhausted after ${i} attempt(s); not trying the remaining ${keys.length - i} key(s).`
       );
       return {
         ok: false,
