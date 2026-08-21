@@ -1,6 +1,7 @@
 import { NextResponse } from 'next/server';
 import { groqChatCompletion } from '@/lib/groq';
 import { requireUser } from '@/lib/api/requireUser';
+import { getUserGroqKey } from '@/lib/api/userGroqKey';
 import { CHAT_MODEL, CHAT_MAX_TOKENS, CHAT_REASONING_EFFORT } from '@/lib/groqModels';
 
 const CATEGORIES = [
@@ -80,8 +81,14 @@ export async function POST(request) {
   const auth = await requireUser();
   if (auth.error) return auth.error;
 
+  // From the session, not the request body. The body version meant the browser
+  // had to hold the raw key, and any caller could supply any string and have it
+  // billed. It also means a user with their own key stops competing for the
+  // operator's shared per-organisation token allowance.
+  const userApiKey = await getUserGroqKey();
+
   try {
-    const { messages, tripContext, itinerary, userApiKey } = await request.json();
+    const { messages, tripContext, itinerary } = await request.json();
 
     if (!Array.isArray(messages)) {
       return NextResponse.json({ error: 'messages must be an array' }, { status: 400 });

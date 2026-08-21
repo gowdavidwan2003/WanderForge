@@ -2,6 +2,7 @@ import { NextResponse } from 'next/server';
 import { groqChatCompletion } from '@/lib/groq';
 import { REALISM_RULES, preferencesBlock } from '@/lib/itineraryPrompt';
 import { requireUser } from '@/lib/api/requireUser';
+import { getUserGroqKey } from '@/lib/api/userGroqKey';
 import { PLANNING_MODEL, PLANNING_REASONING_EFFORT, planningMaxTokens } from '@/lib/groqModels';
 
 /**
@@ -23,6 +24,12 @@ export async function POST(request) {
   const auth = await requireUser();
   if (auth.error) return auth.error;
 
+  // From the session, not the request body. The body version meant the browser
+  // had to hold the raw key, and any caller could supply any string and have it
+  // billed. It also means a user with their own key stops competing for the
+  // operator's shared per-organisation token allowance.
+  const userApiKey = await getUserGroqKey();
+
   try {
     const {
       destination,
@@ -35,7 +42,6 @@ export async function POST(request) {
       interests = [],
       notes = '',
       currency,
-      userApiKey,
     } = await request.json();
 
     if (!destination) {

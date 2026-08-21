@@ -116,8 +116,10 @@ export default function PrivacyPage() {
           they accepted.
         </li>
         <li>
-          <strong>An API key, if you add one</strong> — stored encrypted, used only
-          to make AI requests on your behalf.
+          <strong>An API key, if you add one</strong> — encrypted with AES-256-GCM
+          before it is stored, decrypted only on the server to make AI requests on
+          your behalf, and never sent back to your browser. You can remove it at
+          any time from your profile.
         </li>
       </ul>
 
