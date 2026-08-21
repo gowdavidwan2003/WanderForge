@@ -114,6 +114,20 @@ SELECT set_config(
 );
 
 -- ---------------------------------------------------------------
+-- 1b. Snapshot the index counters.
+--
+--     pg_stat_user_indexes is cumulative for the whole database and is NOT
+--     transactional — it survives the ROLLBACK at the bottom of this file. Read
+--     raw, it reports every request the app has ever served mixed in with this
+--     benchmark, which makes it impossible to tell what this run actually did.
+--     Section 6 diffs against this snapshot instead.
+-- ---------------------------------------------------------------
+CREATE TEMP TABLE bench_index_before AS
+SELECT indexrelid, idx_scan
+FROM pg_stat_user_indexes
+WHERE schemaname = 'public';
+
+-- ---------------------------------------------------------------
 -- 2. Become that user, so RLS is actually in force.
 --    request.jwt.claims is what auth.uid() reads.
 -- ---------------------------------------------------------------
@@ -162,21 +176,35 @@ SELECT trip_id FROM public.trip_collaborators
 WHERE user_id = (SELECT auth.uid()) AND accepted = false;
 
 -- ---------------------------------------------------------------
--- 6. Index inventory: what exists, how big, and how often it has
---    been used since statistics were last reset. An index with
---    idx_scan = 0 on a table with real traffic is a candidate for
---    the next round of pruning.
+-- 6. Index usage, as a delta against the snapshot from 1b.
 -- ---------------------------------------------------------------
 RESET ROLE;
 
+-- `scans_this_run` is what the queries above actually did. `scans_total` is the
+-- lifetime figure, and a 0 there on an index created by 012 means only that it
+-- is new — not that it is useless.
+--
+-- What to expect after 012, on the 200,000 seeded activities:
+--   trip_days_pkey    ~one scan per activity row — the correlated EXISTS
+--                     resolving through the primary key. This is the win; before
+--                     012 the same work is a Seq Scan and does not appear here.
+--   trips_pkey        ~one per distinct trip touched.
+--   trip_collaborators_trip_id_user_id_key
+--                     is_trip_collaborator. It should be LOW: it is the last
+--                     branch of each OR and the owner check answers first. A
+--                     count near the activity count means Postgres is not
+--                     short-circuiting, and the function is worth folding into
+--                     the EXISTS as a LEFT JOIN instead.
 SELECT
-  relname       AS table_name,
-  indexrelname  AS index_name,
-  idx_scan      AS scans,
-  pg_size_pretty(pg_relation_size(indexrelid)) AS size
-FROM pg_stat_user_indexes
-WHERE schemaname = 'public'
-ORDER BY idx_scan ASC, pg_relation_size(indexrelid) DESC;
+  i.relname       AS table_name,
+  i.indexrelname  AS index_name,
+  i.idx_scan - COALESCE(b.idx_scan, 0) AS scans_this_run,
+  i.idx_scan      AS scans_total,
+  pg_size_pretty(pg_relation_size(i.indexrelid)) AS size
+FROM pg_stat_user_indexes i
+LEFT JOIN bench_index_before b ON b.indexrelid = i.indexrelid
+WHERE i.schemaname = 'public'
+ORDER BY scans_this_run DESC, pg_relation_size(i.indexrelid) DESC;
 
 -- ---------------------------------------------------------------
 -- Everything above is discarded.
