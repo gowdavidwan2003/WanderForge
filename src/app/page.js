@@ -4,6 +4,9 @@ import { useEffect, useRef, useState } from 'react';
 import Link from 'next/link';
 import Button from '@/components/ui/Button';
 import Footer from '@/components/layout/Footer';
+import { MAX_TRIP_DAYS } from '@/lib/tripLimits';
+import { ACTIVITY_CATEGORIES } from '@/lib/itineraryPrompt';
+import { TEMPLATE_COUNT } from '@/lib/templates';
 
 const DESTINATIONS = [
   'Paris', 'Tokyo', 'Bali', 'New York', 'Rome', 'Dubai', 'London',
@@ -11,42 +14,63 @@ const DESTINATIONS = [
   'Marrakech', 'Cape Town', 'Rio de Janeiro', 'Bangkok', 'Prague',
 ];
 
+/**
+ * What the landing page claims.
+ *
+ * Every entry here was checked against the codebase before it was written. The
+ * previous version advertised drag-and-drop reordering, offline access, AI
+ * suggesting indoor alternatives on rainy days, AI money-saving suggestions,
+ * weather alerts, Google Calendar sync and a shareable read-only link. None of
+ * those existed — @dnd-kit and idb were installed and imported by nothing at all
+ * — and the stats block claimed 50,000 trips planned and a 4.9 star rating for
+ * an app with no analytics and no reviews table in use.
+ *
+ * The rule for this file: if you cannot point at the code that does it, it does
+ * not go on the landing page. Several of the replacements are things the app
+ * genuinely does that it was not bothering to mention.
+ */
 const FEATURES = [
   {
     icon: '🤖',
     title: 'AI-Powered Planning',
-    desc: 'Our AI crafts the optimal itinerary — maximizing experiences, minimizing transit time, and respecting your budget.',
+    // src/lib/itineraryPrompt.js — the realism rules are the actual prompt.
+    desc: 'Describe the trip you want and the AI plans every day around it, using real road speeds, honest durations and one geographic cluster per day.',
     gradient: 'linear-gradient(135deg, #E8B87D, #C85A3A)',
+  },
+  {
+    icon: '🔍',
+    title: 'Itinerary Check',
+    // src/lib/conflictChecker.js, wired into generation and the editor.
+    desc: 'Every plan is checked against real road distances before it is saved. Overlaps, impossible journeys and days that cannot be walked are flagged where they are — not buried in a report.',
+    gradient: 'linear-gradient(135deg, #42A5F5, #1565C0)',
   },
   {
     icon: '🗺️',
     title: 'Interactive Maps',
-    desc: 'Visualize your entire trip on beautiful maps. See routes, distances, and discover hidden gems nearby.',
+    // src/components/maps/TripMap.jsx + NearbyPlacesPanel.
+    desc: 'See the whole trip on a map, and search for places near any stop to add them to the day.',
     gradient: 'linear-gradient(135deg, #4A8C2A, #2D5016)',
   },
   {
     icon: '👥',
     title: 'Real-time Collaboration',
-    desc: 'Plan together in real-time. Invite friends, see live edits, and build the perfect group trip.',
-    gradient: 'linear-gradient(135deg, #42A5F5, #1565C0)',
-  },
-  {
-    icon: '🌤️',
-    title: 'Weather Intelligence',
-    desc: 'Weather forecasts built into your itinerary. AI suggests indoor alternatives on rainy days.',
-    gradient: 'linear-gradient(135deg, #FFA726, #E65100)',
+    // src/hooks/useRealtimeTrip.js + trip_collaborators.
+    desc: 'Invite people to plan with you. Edits appear as they happen, and the owner can freeze the itinerary once everyone agrees.',
+    gradient: 'linear-gradient(135deg, #AB47BC, #7B1FA2)',
   },
   {
     icon: '💰',
-    title: 'Smart Budget Tracking',
-    desc: 'Multi-currency budget tracking with AI suggestions to save money without sacrificing experiences.',
+    title: 'Budgets and Bill Splitting',
+    // src/lib/settlement.js — integer-cent settlement, and currency.js.
+    desc: 'Track spend against a budget in the local currency, then split shared costs and settle up in the fewest transfers.',
     gradient: 'linear-gradient(135deg, #66BB6A, #2E7D32)',
   },
   {
     icon: '📤',
-    title: 'Export Anywhere',
-    desc: 'Download as PDF, sync to Google Calendar, or share a beautiful read-only link with anyone.',
-    gradient: 'linear-gradient(135deg, #AB47BC, #7B1FA2)',
+    title: 'Take It With You',
+    // src/lib/exportUtils.js — jsPDF and ical-generator.
+    desc: 'Download the itinerary as a PDF, or as a calendar file you can import anywhere. Daily weather sits alongside each day while you plan.',
+    gradient: 'linear-gradient(135deg, #FFA726, #E65100)',
   },
 ];
 
@@ -54,34 +78,42 @@ const STEPS = [
   {
     num: '01',
     title: 'Tell Us Your Dream',
-    desc: 'Enter your destination, dates, interests, and how you want to travel. Our AI listens.',
+    desc: 'Enter your destination, dates, interests, and how you want to travel.',
     icon: '✨',
   },
   {
     num: '02',
     title: 'AI Forges Your Plan',
-    desc: 'Our AI optimizes your itinerary for the best experience, smart timing, and budget-friendly routes.',
+    desc: 'A full day-by-day itinerary, then checked against real travel times before a single activity is saved.',
     icon: '🔥',
   },
   {
     num: '03',
-    title: 'Customize & Collaborate',
-    desc: 'Drag and drop activities, invite friends to edit in real-time, and fine-tune every detail.',
+    title: 'Refine & Collaborate',
+    desc: 'Reorder activities, rebuild any day around what is on it, and invite friends to edit alongside you.',
     icon: '🎨',
   },
   {
     num: '04',
     title: 'Go Explore!',
-    desc: "Access your itinerary offline, get weather alerts, and track your budget as you travel.",
+    desc: 'Export to PDF or your calendar, and split the bills with everyone as you travel.',
     icon: '🚀',
   },
 ];
 
+/**
+ * Facts, not metrics.
+ *
+ * These were 50K+ trips, 120+ countries and a 4.9 star rating — none measured,
+ * none measurable, and two of them referring to systems the app does not have.
+ * What is here now is either a constant in the codebase or trivially checkable,
+ * and the two that are constants are imported so the page cannot drift from them.
+ */
 const STATS = [
-  { num: '50K+', label: 'Trips Planned' },
-  { num: '120+', label: 'Countries' },
-  { num: '4.9★', label: 'User Rating' },
-  { num: '100%', label: 'Free' },
+  { num: `${TEMPLATE_COUNT}`, label: 'Starting Points' },
+  { num: `${MAX_TRIP_DAYS}`, label: 'Days Per Trip' },
+  { num: `${ACTIVITY_CATEGORIES.length}`, label: 'Activity Types' },
+  { num: 'Free', label: 'No Card Needed' },
 ];
 
 export default function LandingPage() {
@@ -162,7 +194,7 @@ export default function LandingPage() {
             </Link>
             <Link href="/explore">
               <Button size="lg" variant="secondary">
-                Explore Templates
+                Explore Destinations
               </Button>
             </Link>
           </div>

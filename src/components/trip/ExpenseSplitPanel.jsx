@@ -260,16 +260,20 @@ export default function ExpenseSplitPanel({ tripId, trip, collaborators = [], is
           <p className="split__muted">Loading expenses...</p>
         ) : setupNeeded ? (
           <div className="split">
+            {/* This used to tell the traveler to run
+                `supabase/migrations/005_expenses_and_currency.sql` in the
+                Supabase SQL Editor. That is an instruction for whoever deployed
+                the app, shown to someone who wants to split a dinner bill and
+                has no Supabase account, no SQL editor and no idea what a
+                migration is. The person who can fix it is not in the room, so
+                say what is true and get out of the way. */}
             <div className="split__setup">
               <span className="split__setup-icon">🛠️</span>
-              <h4>One setup step left</h4>
+              <h4>Bill splitting isn&apos;t switched on</h4>
               <p className="split__muted">
-                Expense splitting needs its database tables. Run this migration in the
-                Supabase SQL Editor, then reopen this panel:
-              </p>
-              <code className="split__code">supabase/migrations/005_expenses_and_currency.sql</code>
-              <p className="split__muted">
-                Everything else on this trip works without it.
+                This feature isn&apos;t available on this WanderForge yet — it needs
+                to be enabled by whoever set the app up. Everything else on your
+                trip works normally.
               </p>
               <Button variant="ghost" size="sm" onClick={load}>Check again</Button>
             </div>

@@ -7,41 +7,9 @@ import { useToast } from '@/components/ui/Toast';
 import { getSupabaseBrowserClient } from '@/lib/supabase/client';
 import Button from '@/components/ui/Button';
 import Footer from '@/components/layout/Footer';
-
-const TEMPLATE_DATA = [
-  { destination: 'Paris, France', duration: 5, icon: '🗼', cover: '#E8B87D', tags: ['culture', 'food', 'romance'], desc: 'The City of Lights — iconic landmarks, world-class cuisine, and unforgettable strolls along the Seine.' },
-  { destination: 'Tokyo, Japan', duration: 7, icon: '🏯', cover: '#C85A3A', tags: ['culture', 'food', 'technology'], desc: 'A mesmerizing blend of ancient temples, futuristic tech, and the best street food on Earth.' },
-  { destination: 'Bali, Indonesia', duration: 6, icon: '🌴', cover: '#4A8C2A', tags: ['nature', 'relaxation', 'adventure'], desc: 'Lush rice terraces, sacred temples, stunning beaches, and spiritual healing experiences.' },
-  { destination: 'New York, USA', duration: 5, icon: '🗽', cover: '#42A5F5', tags: ['sightseeing', 'food', 'nightlife'], desc: 'The city that never sleeps — Broadway, Central Park, world-class museums, and pizza.' },
-  { destination: 'Rome, Italy', duration: 4, icon: '🏛️', cover: '#B88A4D', tags: ['history', 'food', 'culture'], desc: 'Ancient ruins, Renaissance art, gelato on every corner, and la dolce vita.' },
-  { destination: 'Dubai, UAE', duration: 4, icon: '🏙️', cover: '#DAA520', tags: ['luxury', 'shopping', 'adventure'], desc: 'Futuristic skyline, desert safaris, world-class shopping, and over-the-top luxury.' },
-  { destination: 'London, UK', duration: 5, icon: '🎡', cover: '#8B4513', tags: ['history', 'culture', 'nightlife'], desc: 'Royal palaces, West End theatres, classic pubs, and iconic double-decker buses.' },
-  { destination: 'Barcelona, Spain', duration: 5, icon: '⛪', cover: '#E57C23', tags: ['culture', 'food', 'nightlife'], desc: 'Gaudí masterpieces, tapas bars, Mediterranean beaches, and infectious energy.' },
-  { destination: 'Sydney, Australia', duration: 6, icon: '🏖️', cover: '#0077B6', tags: ['nature', 'adventure', 'food'], desc: 'The Opera House, Bondi Beach, Blue Mountains, and the best coffee culture.' },
-  { destination: 'Reykjavik, Iceland', duration: 4, icon: '🌋', cover: '#2D5016', tags: ['nature', 'adventure', 'photography'], desc: 'Northern Lights, geysers, blue lagoons, and otherworldly volcanic landscape.' },
-  { destination: 'Santorini, Greece', duration: 4, icon: '🏝️', cover: '#2196F3', tags: ['romance', 'relaxation', 'food'], desc: 'White-washed villages, breathtaking sunsets, Mediterranean cuisine, and crystal waters.' },
-  { destination: 'Marrakech, Morocco', duration: 4, icon: '🕌', cover: '#D2691E', tags: ['culture', 'food', 'shopping'], desc: 'Vibrant souks, stunning palaces, aromatic tagines, and desert excursions.' },
-  { destination: 'Cape Town, South Africa', duration: 5, icon: '⛰️', cover: '#228B22', tags: ['nature', 'adventure', 'food'], desc: 'Table Mountain, wine country, stunning coastline, and incredible biodiversity.' },
-  { destination: 'Bangkok, Thailand', duration: 5, icon: '🛕', cover: '#FF8C00', tags: ['food', 'culture', 'nightlife'], desc: 'Ornate temples, floating markets, legendary street food, and vibrant nightlife.' },
-  { destination: 'Prague, Czech Republic', duration: 3, icon: '🏰', cover: '#8B0000', tags: ['history', 'culture', 'nightlife'], desc: 'Fairy-tale architecture, affordable beer, charming old town, and magical bridges.' },
-  { destination: 'Maldives', duration: 5, icon: '🐠', cover: '#00CED1', tags: ['relaxation', 'nature', 'romance'], desc: 'Crystal-clear waters, overwater bungalows, world-class diving, and total serenity.' },
-  { destination: 'Kyoto, Japan', duration: 4, icon: '⛩️', cover: '#DC143C', tags: ['culture', 'nature', 'history'], desc: 'Traditional geisha districts, bamboo forests, zen gardens, and 2000+ temples.' },
-  { destination: 'Rio de Janeiro, Brazil', duration: 5, icon: '🎉', cover: '#32CD32', tags: ['adventure', 'nightlife', 'nature'], desc: 'Christ the Redeemer, Copacabana, samba rhythms, and the Amazon rainforest.' },
-  { destination: 'Istanbul, Turkey', duration: 4, icon: '🌙', cover: '#4169E1', tags: ['history', 'food', 'culture'], desc: 'Where East meets West — bazaars, mosques, hamams, and incredible kebabs.' },
-  { destination: 'Amsterdam, Netherlands', duration: 3, icon: '🌷', cover: '#FF6347', tags: ['culture', 'nightlife', 'photography'], desc: 'Canal cruises, world-class museums, cycling culture, and vibrant neighborhoods.' },
-  { destination: 'Cusco, Peru', duration: 5, icon: '🦙', cover: '#8B4513', tags: ['history', 'adventure', 'nature'], desc: 'Gateway to Machu Picchu, Inca heritage, stunning Andes, and coca tea.' },
-  { destination: 'Vienna, Austria', duration: 3, icon: '🎻', cover: '#9370DB', tags: ['culture', 'history', 'food'], desc: 'Imperial palaces, classical music, Sachertorte, and coffee house tradition.' },
-  { destination: 'Singapore', duration: 3, icon: '🦁', cover: '#FF4500', tags: ['food', 'sightseeing', 'shopping'], desc: 'Marina Bay, hawker centres, Gardens by the Bay, and futuristic architecture.' },
-  { destination: 'Lisbon, Portugal', duration: 4, icon: '⚓', cover: '#F4A460', tags: ['food', 'culture', 'nightlife'], desc: 'Colorful tiles, pastel de nata, fado music, and stunning coastal views.' },
-  { destination: 'Jaipur, India', duration: 4, icon: '🐘', cover: '#E75480', tags: ['history', 'culture', 'shopping'], desc: 'The Pink City — majestic forts, vibrant bazaars, spicy curries, and royal heritage.' },
-  { destination: 'Seoul, South Korea', duration: 5, icon: '🎎', cover: '#663399', tags: ['food', 'culture', 'technology'], desc: 'K-pop, kimchi, ancient palaces, neon streets, and the best skincare shopping.' },
-  { destination: 'Cairo, Egypt', duration: 4, icon: '🐫', cover: '#CD853F', tags: ['history', 'adventure', 'culture'], desc: 'The Pyramids, the Sphinx, the Nile, and 5000 years of fascinating history.' },
-  { destination: 'Queenstown, New Zealand', duration: 4, icon: '🏔️', cover: '#2E8B57', tags: ['adventure', 'nature', 'photography'], desc: 'Adventure capital — bungee jumping, skiing, Lord of the Rings landscapes.' },
-  { destination: 'Havana, Cuba', duration: 4, icon: '🚗', cover: '#B22222', tags: ['culture', 'nightlife', 'history'], desc: 'Vintage cars, salsa music, colonial architecture, and mojitos on the Malecón.' },
-  { destination: 'Dubai → Abu Dhabi, UAE', duration: 5, icon: '🌆', cover: '#B8860B', tags: ['luxury', 'adventure', 'culture'], desc: 'Desert safaris, world records, Grand Mosque, and the ultimate luxury experience.' },
-];
-
-const ALL_TAGS = [...new Set(TEMPLATE_DATA.flatMap(t => t.tags))].sort();
+import { ALL_TAGS, TEMPLATE_DATA, templateInterests } from '@/lib/templates';
+import { withTimeout } from '@/lib/withTimeout';
+import { inferCurrency } from '@/lib/currency';
 
 export default function ExplorePage() {
   const [filter, setFilter] = useState('all');
@@ -71,32 +39,45 @@ export default function ExplorePage() {
     endDate.setDate(endDate.getDate() + template.duration - 1);
 
     try {
-      const { data: trip, error } = await supabase
-        .from('trips')
-        .insert({
-          user_id: user.id,
-          title: `Trip to ${template.destination}`,
-          destination: template.destination,
-          start_date: startDate.toISOString().split('T')[0],
-          end_date: endDate.toISOString().split('T')[0],
-          status: 'planned',
-          ai_preferences: { tags: template.tags, from_template: true },
-        })
-        .select()
-        .single();
-
-      if (error) throw error;
-
-      // Create days
       const days = Array.from({ length: template.duration }, (_, i) => {
         const d = new Date(startDate);
         d.setDate(d.getDate() + i);
-        return { trip_id: trip.id, day_number: i + 1, date: d.toISOString().split('T')[0] };
+        return { day_number: i + 1, date: d.toISOString().split('T')[0] };
       });
 
-      await supabase.from('trip_days').insert(days);
+      // One transaction, like the wizard. This was an insert of the trip
+      // followed by an insert of its days, so a failure on the second left a
+      // trip the editor cannot open.
+      const { data: trip, error } = await withTimeout(
+        supabase.rpc('create_trip_with_days', {
+          p_trip: {
+            title: `Trip to ${template.destination}`,
+            destination: template.destination,
+            start_date: startDate.toISOString().split('T')[0],
+            end_date: endDate.toISOString().split('T')[0],
+            status: 'planned',
+            currency: inferCurrency(template.destination) || 'USD',
+            ai_preferences: {
+              // `interests`, not `tags`. The generate route reads
+              // ai_preferences.interests, so writing `tags` here meant every
+              // template produced the same generic trip and the destination's
+              // whole character was thrown away.
+              interests: templateInterests(template),
+              from_template: true,
+            },
+          },
+          p_days: days,
+        }),
+        'Creating your trip'
+      );
 
-      toast.success(`Trip created! Now let AI fill in your itinerary.`, 'Template Applied 🎉');
+      if (error) throw error;
+      if (!trip?.id) throw new Error('The trip was not created. Please try again.');
+
+      toast.success(
+        `${template.duration} days in ${template.destination} are ready to plan.`,
+        'Trip Created 🎉'
+      );
       router.push(`/trip/${trip.id}`);
     } catch (err) {
       toast.error(err.message);
@@ -111,7 +92,11 @@ export default function ExplorePage() {
             <span className="explore__emoji">🗺️</span>
             <h1 className="explore__title">Explore Destinations</h1>
             <p className="explore__subtitle">
-              {TEMPLATE_DATA.length}{' '}curated templates for the world&apos;s most visited destinations
+              {/* Not "curated templates": nothing here is a hand-built
+                  itinerary. Each one is a destination, a sensible length and a
+                  few interests, which the AI then plans for you. */}
+              {TEMPLATE_DATA.length}{' '}starting points for the world&apos;s most visited destinations —
+              pick one and the AI plans the days
             </p>
 
             <div className="explore__search">
