@@ -1,5 +1,5 @@
 import { NextResponse } from 'next/server';
-import { groqChatCompletion } from '@/lib/groq';
+import { groqChatCompletion, groqChatCompletionStream } from '@/lib/groq';
 import { REALISM_RULES, preferencesBlock } from '@/lib/itineraryPrompt';
 import { requireUser } from '@/lib/api/requireUser';
 import { clampRequestedDays } from '@/lib/tripLimits';
@@ -7,6 +7,12 @@ import { PLANNING_MODEL, PLANNING_REASONING_EFFORT, planningMaxTokens } from '@/
 import { validateItinerary, validationRetryPrompt } from '@/lib/itinerarySchema';
 import { geocodeItinerary } from '@/lib/placeLookup';
 import { getGeocodeCacheClients } from '@/lib/api/geocodeCacheClients';
+import {
+  createItineraryStreamParser,
+  extractJsonObject,
+  groqTextDeltas,
+  sseEvent,
+} from '@/lib/streamingJson';
 import {
   blockingIssues,
   checkGeneratedItinerary,
@@ -129,6 +135,238 @@ async function requestItinerary(messages, { budget, userApiKey, days }) {
   }
 }
 
+/**
+ * Everything after the model has finished writing.
+ *
+ * Shared by both paths: validate, resolve coordinates, run the deterministic
+ * check, and re-prompt once if the plan is not achievable. Streaming changes
+ * when the user sees the days, not what is done to them before they are saved.
+ *
+ * @param onStatus called with a short line for the progress display
+ */
+async function finishPlan(raw, {
+  days, budget, userApiKey, messages, near, transportMode, totalBudget,
+  onStatus = () => {},
+}) {
+  let plan = null;
+  let errors = null;
+  let completions = 1;
+
+  const validated = validateItinerary(raw, { days });
+  if (validated.ok) plan = validated.data;
+  else errors = validated.errors;
+
+  if (!plan && budget.canAfford(MIN_COMPLETION_MS)) {
+    onStatus('Fixing the format the model got wrong…');
+    messages.push({ role: 'user', content: validationRetryPrompt(errors) });
+
+    const retry = await requestItinerary(messages, { budget, userApiKey, days });
+    completions++;
+
+    if (!retry.failure && !retry.errors) {
+      const revalidated = validateItinerary(retry.raw, { days });
+      if (revalidated.ok) { plan = revalidated.data; errors = null; }
+      else errors = revalidated.errors;
+    }
+  }
+
+  if (!plan) return { ok: false, errors: errors ?? [] };
+
+  const tripShape = {
+    transport_mode: transportMode,
+    total_budget: Number(totalBudget) || null,
+    currency: plan.currency || '',
+  };
+
+  onStatus('Placing everything on the map…');
+  const cache = await getGeocodeCacheClients();
+  let geo = { itinerary: plan.itinerary, located: 0, total: 0, hits: new Map(), stats: null };
+  if (budget.canAfford(MIN_GEOCODE_MS)) {
+    geo = await geocodeItinerary(plan.itinerary, { near, deadlineAt: budget.deadlineAt(), cache });
+  }
+
+  onStatus('Checking every journey against real road distances…');
+  let check = checkGeneratedItinerary(geo.itinerary, tripShape);
+
+  const conflictPrompt = conflictRetryPrompt(check.issues, geo.itinerary);
+  if (conflictPrompt && budget.canAfford(MIN_COMPLETION_MS)) {
+    onStatus('Some days do not work — asking for a fix…');
+    messages.push({ role: 'user', content: conflictPrompt });
+
+    const retry = await requestItinerary(messages, { budget, userApiKey, days });
+    completions++;
+
+    if (!retry.failure && !retry.errors) {
+      const revalidated = validateItinerary(retry.raw, { days });
+      if (revalidated.ok) {
+        const reGeo = budget.canAfford(MIN_GEOCODE_MS)
+          ? await geocodeItinerary(revalidated.data.itinerary, {
+              near, deadlineAt: budget.deadlineAt(), cache, known: geo.hits,
+            })
+          : { itinerary: revalidated.data.itinerary, located: 0, total: 0, hits: geo.hits };
+
+        const reCheck = checkGeneratedItinerary(reGeo.itinerary, tripShape);
+        // Keep whichever plan is actually more achievable. A model asked to fix
+        // a schedule will sometimes return one that is worse.
+        if (blockingIssues(reCheck.issues).length < blockingIssues(check.issues).length) {
+          plan = revalidated.data;
+          geo = reGeo;
+          check = reCheck;
+        }
+      }
+    }
+  }
+
+  return {
+    ok: true,
+    payload: {
+      ...plan,
+      itinerary: geo.itinerary,
+      conflicts: conflictPayload(check, {
+        attempts: completions,
+        geocoded: { located: geo.located, total: geo.total, ...(geo.stats || {}) },
+      }),
+    },
+  };
+}
+
+/**
+ * Stream the itinerary day by day.
+ *
+ * The days that arrive here are a PREVIEW and nothing more. Nothing is saved
+ * from them — they exist so the user sees their first day in a couple of seconds
+ * instead of watching a spinner for forty. The authoritative payload arrives in
+ * the `complete` event, after the same validate → geocode → check pipeline the
+ * non-streaming path runs, and that is the only thing the client writes. Keeping
+ * the write at the end is what preserves the guarantee from S2-1: no model
+ * output, however it arrives, can produce a partially-populated trip.
+ *
+ * Splitting generation into one request per day would stream more cleanly and is
+ * not possible here: Groq counts prompt plus reserved completion against a
+ * single 8,000 tokens-per-minute allowance, and five requests each carrying the
+ * system prompt would exceed it before the third.
+ */
+function streamItinerary({ messages, days, budget, userApiKey, near, transportMode, totalBudget }) {
+  const encoder = new TextEncoder();
+  // Aborted when the browser goes away, so a cancelled generation stops costing
+  // money instead of running to completion into a socket nobody is reading.
+  const upstream = new AbortController();
+
+  const stream = new ReadableStream({
+    async start(controller) {
+      const send = (event, data) => {
+        try {
+          controller.enqueue(encoder.encode(sseEvent(event, data)));
+        } catch {
+          // The client has gone. cancel() below deals with the upstream.
+        }
+      };
+
+      try {
+        send('status', { message: 'Asking the AI to plan your trip…' });
+
+        const promptText = messages.map((m) => m.content).join('\n');
+        const result = await groqChatCompletionStream(
+          {
+            model: PLANNING_MODEL,
+            messages,
+            temperature: 0.4,
+            // Deliberately NO response_format: json_object here, unlike the
+            // non-streaming path. Measured against gpt-oss-120b on a 5-day
+            // itinerary: with JSON mode the first byte arrives at 6.4s and all
+            // 12KB lands in the following 3ms — it buffers the whole completion,
+            // which makes streaming pointless. Without it, the first byte is at
+            // 116ms and day 1 is on screen at 1.9s. The cost is that the model
+            // may wrap its answer in prose or a fence, which extractJsonObject
+            // handles and validateItinerary catches whatever is left.
+            reasoning_effort: PLANNING_REASONING_EFFORT,
+            max_completion_tokens: planningMaxTokens(days, promptText),
+          },
+          { userApiKey, budgetMs: budget.completionSlice(), signal: upstream.signal }
+        );
+
+        if (!result.ok) {
+          send('error', { message: result.error, status: result.status });
+          controller.close();
+          return;
+        }
+
+        const parser = createItineraryStreamParser();
+        let seen = 0;
+
+        for await (const delta of groqTextDeltas(result.body, { signal: upstream.signal })) {
+          for (const day of parser.push(delta)) {
+            seen++;
+            send('day', { day, index: seen, expected: days });
+          }
+        }
+
+        if (upstream.signal.aborted) {
+          controller.close();
+          return;
+        }
+
+        send('status', { message: 'Checking the plan before saving it…' });
+
+        // Tolerant of a fence or a sentence around it, because JSON mode is off
+        // on this path. Returns null when the stream ended mid-object — the
+        // model hit its token ceiling, or the connection dropped.
+        const raw = extractJsonObject(parser.text());
+
+        if (!raw) {
+          // The days already on screen are a preview of something that will not
+          // be saved, so say so rather than leaving them looking finished.
+          send('error', {
+            message: seen > 0
+              ? `The itinerary stopped after ${seen} day${seen === 1 ? '' : 's'}. Try generating fewer days at a time.`
+              : 'The AI returned malformed itinerary data. Please try again.',
+          });
+          controller.close();
+          return;
+        }
+
+        const finished = await finishPlan(raw, {
+          days, budget, userApiKey, messages, near, transportMode, totalBudget,
+          onStatus: (message) => send('status', { message }),
+        });
+
+        if (!finished.ok) {
+          send('error', {
+            message:
+              'The AI returned an itinerary in a shape we could not use, twice. Nothing was saved — please try again.',
+            details: finished.errors,
+          });
+        } else {
+          send('complete', finished.payload);
+        }
+      } catch (err) {
+        if (!upstream.signal.aborted) {
+          console.error('AI Streaming Error:', err);
+          send('error', { message: err.message || 'Failed to generate itinerary' });
+        }
+      } finally {
+        try { controller.close(); } catch { /* already closed */ }
+      }
+    },
+
+    /** The browser closed the connection — stop paying Groq for the rest. */
+    cancel() {
+      upstream.abort();
+    },
+  });
+
+  return new Response(stream, {
+    headers: {
+      'Content-Type': 'text/event-stream; charset=utf-8',
+      'Cache-Control': 'no-cache, no-transform',
+      Connection: 'keep-alive',
+      // Vercel and nginx both buffer proxied responses by default, which would
+      // hold every event back until the stream ended and undo the entire point.
+      'X-Accel-Buffering': 'no',
+    },
+  });
+}
+
 export async function POST(request) {
   // These routes spend the operator's Google and Groq quota, so they must
   // not be callable anonymously.
@@ -150,6 +388,7 @@ export async function POST(request) {
       destLat,
       destLng,
       totalBudget,
+      stream: wantsStream = false,
     } = body;
 
     // `days` is attacker-controlled and drives both cost centres: one AI day per
@@ -177,142 +416,62 @@ ${FORMAT_BLOCK}`;
       { role: 'user', content: userPrompt },
     ];
 
-    // ---- 1. A response that matches the contract -------------------------
-    // Nothing reaches Postgres until this passes. Previously JSON.parse was the
-    // entire contract, so "9am" in a TIME column or "TBD" in a CHECK-constrained
-    // category was rejected row by row, halfway through writing the trip.
-    let plan = null;
-    let errors = null;
-    let completions = 0;
-
-    for (let attempt = 0; attempt < 2; attempt++) {
-      if (attempt > 0) {
-        // One retry, and only if there is time for it. Returning the failure is
-        // better than being killed mid-flight with no response body at all.
-        if (!budget.canAfford(MIN_COMPLETION_MS)) break;
-
-        // Deliberately WITHOUT the model's own previous answer. Echoing it back
-        // would make the error paths ("itinerary[0].activities[2].start_time")
-        // resolvable, but it costs a second full copy of the itinerary against an
-        // 8,000 token-per-minute ceiling shared with the reply — so the retry
-        // would truncate. The errors quote both the path and the offending value,
-        // which is what the model actually needs to fix.
-        messages.push({ role: 'user', content: validationRetryPrompt(errors) });
-      }
-
-      const res = await requestItinerary(messages, { budget, userApiKey, days });
-      completions++;
-
-      // A provider error is not something a retry fixes — it fails identically
-      // while burning the budget.
-      if (res.failure) return res.failure;
-
-      if (res.errors) {
-        errors = res.errors;
-        continue;
-      }
-
-      const validated = validateItinerary(res.raw, { days });
-      if (validated.ok) {
-        plan = validated.data;
-        errors = null;
-        break;
-      }
-
-      errors = validated.errors;
-      console.warn(
-        `[WanderForge] Generated itinerary failed validation (attempt ${attempt + 1}): ${errors.slice(0, 5).join('; ')}`
-      );
+    // Streaming exists so the first day appears in seconds instead of forty.
+    // Everything that decides what actually gets saved happens after the stream
+    // ends, in finishPlan, exactly as it does below.
+    if (wantsStream) {
+      return streamItinerary({
+        messages, days, budget, userApiKey, near, transportMode, totalBudget,
+      });
     }
 
-    if (!plan) {
+    // ---- The non-streaming path ------------------------------------------
+    // Kept for callers that want one response: the AI Fill Day button, and any
+    // client that cannot read a stream.
+    //
+    // Nothing reaches Postgres until validation passes. Previously JSON.parse
+    // was the entire contract, so "9am" in a TIME column or "TBD" in a
+    // CHECK-constrained category was rejected row by row, halfway through
+    // writing the trip.
+    const first = await requestItinerary(messages, { budget, userApiKey, days });
+
+    // A provider error is not something a retry fixes — it fails identically
+    // while burning the budget.
+    if (first.failure) return first.failure;
+
+    if (first.errors) {
       return NextResponse.json(
         {
-          error:
-            'The AI returned an itinerary in a shape we could not use, twice. Nothing was saved — please try again.',
-          details: errors ?? [],
+          error: 'The AI did not return usable JSON. Nothing was saved — please try again.',
+          details: first.errors,
         },
         { status: 502 }
       );
     }
 
-    // ---- 2. Coordinates, then the deterministic check ---------------------
-    // The checker's central question — can you actually get from this place to
-    // that one in the gap left for it — needs coordinates, and geocoding used to
-    // happen in the browser only after everything had been written.
-    const tripShape = {
-      transport_mode: transportMode,
-      total_budget: Number(totalBudget) || null,
-      currency: plan.currency || '',
-    };
+    const finished = await finishPlan(first.raw, {
+      days, budget, userApiKey, messages, near, transportMode, totalBudget,
+    });
 
-    // Cache-first, and shared across users: a destination somebody has already
-    // planned should reach Google zero times. Places is ~300x the cost of the
-    // completion that produced this plan.
-    const cache = await getGeocodeCacheClients();
-
-    let geo = { itinerary: plan.itinerary, located: 0, total: 0, hits: new Map(), stats: null };
-    if (budget.canAfford(MIN_GEOCODE_MS)) {
-      geo = await geocodeItinerary(plan.itinerary, {
-        near,
-        deadlineAt: budget.deadlineAt(),
-        cache,
-      });
-    }
-
-    let check = checkGeneratedItinerary(geo.itinerary, tripShape);
-
-    // ---- 3. One re-prompt naming the conflicts ---------------------------
-    // Carries a compact digest of the plan rather than the model's verbatim
-    // answer — same reason as above, and a rescheduling decision only needs the
-    // day, order, times and places.
-    const conflictPrompt = conflictRetryPrompt(check.issues, geo.itinerary);
-    if (conflictPrompt && budget.canAfford(MIN_COMPLETION_MS)) {
-      messages.push({ role: 'user', content: conflictPrompt });
-
-      const res = await requestItinerary(messages, { budget, userApiKey, days });
-      completions++;
-
-      if (!res.failure && !res.errors) {
-        const revalidated = validateItinerary(res.raw, { days });
-        if (revalidated.ok) {
-          const reGeo = budget.canAfford(MIN_GEOCODE_MS)
-            ? await geocodeItinerary(revalidated.data.itinerary, {
-                near,
-                deadlineAt: budget.deadlineAt(),
-                cache,
-                // Most places survive a re-plan, and a lookup already paid for
-                // must not be paid for twice — not even against the cache.
-                known: geo.hits,
-              })
-            : { itinerary: revalidated.data.itinerary, located: 0, total: 0, hits: geo.hits };
-
-          const reCheck = checkGeneratedItinerary(reGeo.itinerary, tripShape);
-
-          // Keep whichever plan is actually more achievable. A model asked to fix
-          // a schedule will sometimes return one that is worse, and the traveler
-          // should not pay for that.
-          if (blockingIssues(reCheck.issues).length < blockingIssues(check.issues).length) {
-            plan = revalidated.data;
-            geo = reGeo;
-            check = reCheck;
-          }
-        }
-      }
+    if (!finished.ok) {
+      console.warn(
+        `[WanderForge] Generated itinerary failed validation twice: ${finished.errors.slice(0, 5).join('; ')}`
+      );
+      return NextResponse.json(
+        {
+          error:
+            'The AI returned an itinerary in a shape we could not use, twice. Nothing was saved — please try again.',
+          details: finished.errors,
+        },
+        { status: 502 }
+      );
     }
 
     // The itinerary always comes back, conflicts and all: a plan the traveler can
     // see and fix beats a 502 that loses the whole generation. `conflicts` is
     // persisted alongside the trip so an unachievable plan stays flagged rather
     // than silently becoming somebody's Tuesday.
-    return NextResponse.json({
-      ...plan,
-      itinerary: geo.itinerary,
-      conflicts: conflictPayload(check, {
-        attempts: completions,
-        geocoded: { located: geo.located, total: geo.total, ...(geo.stats || {}) },
-      }),
-    });
+    return NextResponse.json(finished.payload);
   } catch (err) {
     console.error('AI Generation Error:', err);
     return NextResponse.json(

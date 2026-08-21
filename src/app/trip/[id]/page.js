@@ -37,6 +37,8 @@ import {
 } from '@/lib/realtimeState';
 import { fetchWeather as loadWeather } from '@/lib/weatherCache';
 import TripSettingsPanel from '@/components/trip/TripSettingsPanel';
+import GenerationProgress from '@/components/trip/GenerationProgress';
+import { readSSE } from '@/lib/streamingJson';
 
 const CATEGORY_CONFIG = {
   sightseeing: { icon: '🏛️', color: '#6366F1', label: 'Sightseeing' },
@@ -64,6 +66,12 @@ export default function TripEditorPage({ params }) {
   const [editingActivity, setEditingActivity] = useState(null);
   const [aiGenerating, setAiGenerating] = useState(false);
   const [aiProgress, setAiProgress] = useState(null);
+  // What the stream has produced so far. Preview only — nothing here is saved
+  // until the server's `complete` event arrives.
+  const [streaming, setStreaming] = useState(null);
+  // Lets the Cancel button reach the in-flight request. Aborting closes the SSE
+  // connection, which the route treats as "stop paying Groq".
+  const generateAbortRef = useRef(null);
   const [pendingGenerate, setPendingGenerate] = useState(null);
   // Guards against a double-click landing before the aiGenerating state commits.
   const generatingRef = useRef(false);
@@ -760,11 +768,16 @@ export default function TripEditorPage({ params }) {
     setPendingGenerate(null);
     setAiGenerating(true);
     setAiProgress({ phase: 'planning', done: 0, total: 0 });
+    setStreaming({ status: 'Starting…', days: [], expected: days.length });
+
+    const controller = new AbortController();
+    generateAbortRef.current = controller;
 
     try {
       const res = await fetch('/api/ai/generate', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
+        signal: controller.signal,
         body: JSON.stringify({
           destination: trip.destination,
           days: days.length,
@@ -778,12 +791,45 @@ export default function TripEditorPage({ params }) {
           destLat: trip.dest_lat,
           destLng: trip.dest_lng,
           totalBudget: trip.total_budget,
+          // Day-by-day, so the first one lands in a couple of seconds instead of
+          // forty. What gets saved is unchanged: the server still validates,
+          // geocodes and checks the whole plan before sending `complete`.
+          stream: true,
         }),
       });
 
-      const data = await res.json();
-      if (data.error) throw new Error(data.error);
-      if (!data.itinerary) throw new Error('No itinerary returned');
+      // A failure before the stream opens is still a JSON body.
+      if (!res.ok || !res.body) {
+        const failed = await res.json().catch(() => ({}));
+        throw new Error(failed.error || `Generation failed (${res.status})`);
+      }
+
+      let data = null;
+      let streamError = null;
+
+      for await (const { event, data: payload } of readSSE(res.body, { signal: controller.signal })) {
+        if (event === 'status') {
+          setStreaming((s) => ({ ...s, status: payload.message }));
+        } else if (event === 'day') {
+          setStreaming((s) => ({
+            ...s,
+            days: [...(s?.days || []), payload.day],
+            expected: payload.expected || s?.expected || 0,
+            status: `Day ${payload.day.day}: ${payload.day.theme || 'planned'}`,
+          }));
+        } else if (event === 'error') {
+          streamError = payload;
+        } else if (event === 'complete') {
+          data = payload;
+        }
+      }
+
+      // Cancelled. The route aborts its Groq request when this connection
+      // closes, and nothing has been written, so there is nothing to undo.
+      if (controller.signal.aborted) return;
+
+      if (streamError) throw new Error(streamError.message);
+      if (!data?.itinerary) throw new Error('No itinerary returned');
 
       const total = data.itinerary.reduce((s, d) => s + (d.activities?.length || 0), 0);
       if (total === 0) throw new Error('The AI returned an itinerary with no activities.');
@@ -806,6 +852,7 @@ export default function TripEditorPage({ params }) {
       }
 
       setAiProgress({ phase: 'saving', done: 0, total });
+      setStreaming((s) => ({ ...s, status: 'Saving your itinerary…' }));
 
       // One batch call for everything the server could not place, before the
       // write loop rather than inside it. This used to be a Places lookup per
@@ -860,12 +907,29 @@ export default function TripEditorPage({ params }) {
       // already on screen; re-reading 25 rows the browser just wrote is the
       // pattern this whole ticket is about.
     } catch (err) {
-      toast.error(err.message, 'AI Generation Failed');
+      // An abort is a choice, not a failure, and must not be reported as one.
+      if (err?.name !== 'AbortError') toast.error(err.message, 'AI Generation Failed');
     } finally {
+      generateAbortRef.current = null;
       generatingRef.current = false;
       setAiGenerating(false);
       setAiProgress(null);
+      setStreaming(null);
     }
+  };
+
+  /**
+   * Stop a generation in flight.
+   *
+   * Closing the connection is what stops it: the route aborts its own request to
+   * Groq when the browser goes away, so a cancelled generation stops being
+   * billed rather than running to completion into a socket nobody is reading.
+   * Nothing has been written at this point, so there is nothing to roll back.
+   */
+  const handleCancelGenerate = () => {
+    if (!generateAbortRef.current) return;
+    generateAbortRef.current.abort();
+    toast.info('Generation stopped. Your itinerary is unchanged.', 'Cancelled');
   };
 
   const handleAIGenerate = () => {
@@ -1102,11 +1166,15 @@ export default function TripEditorPage({ params }) {
                   key: 'ai-generate',
                   // A silent multi-minute run is what makes people click again,
                   // so say which phase it is in and how far along.
+                  // The panel below carries the detail now; this just has to
+                  // stop looking like a button worth pressing again.
                   label: !aiGenerating
                     ? 'AI Generate'
                     : aiProgress?.phase === 'saving' && aiProgress.total
                       ? `Saving ${aiProgress.done}/${aiProgress.total}`
-                      : 'Planning your trip...',
+                      : streaming?.days?.length
+                        ? `Day ${streaming.days.length} of ${streaming.expected || '?'}`
+                        : 'Planning...',
                   icon: '🤖',
                   onClick: handleAIGenerate,
                   loading: aiGenerating,
@@ -1254,6 +1322,21 @@ export default function TripEditorPage({ params }) {
                         </Button>
                       </div>
                     </div>
+
+                    {/* Days appear here as the model writes them, so the first
+                        one lands in a couple of seconds instead of forty. It is a
+                        preview — nothing is written until the server finishes
+                        checking the whole plan. */}
+                    {aiGenerating && streaming && (
+                      <GenerationProgress
+                        status={streaming.status}
+                        phase={aiProgress?.phase === 'saving' ? 'saving' : 'planning'}
+                        streamedDays={streaming.days || []}
+                        expected={streaming.expected}
+                        saved={aiProgress?.phase === 'saving' ? aiProgress : null}
+                        onCancel={handleCancelGenerate}
+                      />
+                    )}
 
                     {/* The whole point of S2-3: an impossible day says so where the
                         day is, with the fix next to the problem — not behind a
