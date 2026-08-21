@@ -1,3 +1,5 @@
+'use client';
+
 import Link from 'next/link';
 
 export default function Footer() {
@@ -34,11 +36,22 @@ export default function Footer() {
                 <Link href="/dashboard">My Trips</Link>
               </div>
 
-              {/* The Company column is gone rather than rewritten. It linked
-                  About, Privacy Policy and Terms of Service all to "/" — three
-                  links that looked like documents and were the homepage. A
-                  privacy policy is a real document with legal weight; linking a
-                  placeholder to one is worse than not offering it. */}
+              {/* These three used to point at "/" — links that looked like
+                  documents and were the homepage. They were removed rather than
+                  faked, and are back now that each one resolves to something
+                  real. */}
+              <div className="footer__links">
+                <h4 className="footer__heading">Legal</h4>
+                <Link href="/legal/privacy">Privacy Policy</Link>
+                <Link href="/legal/terms">Terms of Service</Link>
+                <a
+                  href="https://github.com/gowdavidwan2003/WanderForge/blob/main/LICENSE"
+                  target="_blank"
+                  rel="noopener noreferrer"
+                >
+                  MIT License
+                </a>
+              </div>
 
               <div className="footer__links">
                 <h4 className="footer__heading">Connect</h4>

@@ -69,6 +69,10 @@ export default function TripEditorPage({ params }) {
   // What the stream has produced so far. Preview only — nothing here is saved
   // until the server's `complete` event arrives.
   const [streaming, setStreaming] = useState(null);
+  // Spoken by the live region at the bottom of the editor. A reorder is a purely
+  // visual change otherwise: the list silently rearranges and a screen-reader
+  // user has no way to know whether the button did anything.
+  const [announcement, setAnnouncement] = useState('');
   // Lets the Cancel button reach the in-flight request. Aborting closes the SSE
   // connection, which the route treats as "stop paying Groq".
   const generateAbortRef = useRef(null);
@@ -635,18 +639,57 @@ export default function TripEditorPage({ params }) {
     }
   };
 
+  /**
+   * Move one activity up or down its day.
+   *
+   * Reordering is the one editing action with no keyboard or screen-reader
+   * story: the buttons were labelled with bare arrow glyphs, the list silently
+   * rearranged, and focus was lost when the refetch replaced the row. All three
+   * are dealt with here — the button keeps focus by id (the DOM node is
+   * replaced, so focus cannot be restored by reference), and the result is
+   * spoken by the live region.
+   */
   const handleMoveActivity = async (activityId, direction) => {
     if (blockedByLock()) return;
     if (!selectedDay) return;
+
     const dayActs = [...(activities[selectedDay.id] || [])];
-    const idx = dayActs.findIndex(a => a.id === activityId);
+    const idx = dayActs.findIndex((a) => a.id === activityId);
     const newIdx = direction === 'up' ? idx - 1 : idx + 1;
-    if (newIdx < 0 || newIdx >= dayActs.length) return;
+    if (idx === -1 || newIdx < 0 || newIdx >= dayActs.length) return;
+
+    const moved = dayActs[idx];
     [dayActs[idx], dayActs[newIdx]] = [dayActs[newIdx], dayActs[idx]];
-    await Promise.all(dayActs.map((a, i) =>
-      supabase.from('activities').update({ order_index: i }).eq('id', a.id)
-    ));
-    fetchTripData();
+
+    // Locally first: the list reorders immediately rather than after a round
+    // trip, and the announcement describes what the user can already see.
+    const reordered = dayActs.map((a, i) => ({ ...a, order_index: i }));
+    setActivities((prev) => ({ ...prev, [selectedDay.id]: reordered }));
+    echoes.current.remember(reordered.map((a) => a.id));
+    setAnnouncement(
+      `${moved.title} moved to position ${newIdx + 1} of ${dayActs.length}.`
+    );
+
+    const results = await Promise.all(
+      reordered.map((a, i) =>
+        supabase.from('activities').update({ order_index: i }).eq('id', a.id)
+      )
+    );
+
+    const failed = results.filter((r) => r.error);
+    if (failed.length) {
+      toast.error(failed[0].error.message, 'Could not reorder');
+      setAnnouncement('The move could not be saved. The order has been restored.');
+      fetchTripData();
+      return;
+    }
+
+    // Focus follows the activity, not the position. Without this the button the
+    // user just pressed has moved and focus lands wherever React put it — which
+    // for a keyboard user means losing their place mid-reorder.
+    requestAnimationFrame(() => {
+      document.querySelector(`[data-move="${direction}:${activityId}"]`)?.focus();
+    });
   };
 
   // AI Generate itinerary
@@ -1391,16 +1434,35 @@ export default function TripEditorPage({ params }) {
                         </div>
                       </div>
                     ) : (
-                      <div className="timeline">
+                      // An ordered list, because the order is the meaning: a
+                      // screen reader now says "list, 8 items, item 3 of 8"
+                      // instead of reading eight unrelated groups.
+                      <ol className="timeline" aria-label={`Day ${selectedDay.day_number} itinerary`}>
                         {selectedDayActivities.map((activity, idx) => {
                           const cat = CATEGORY_CONFIG[activity.category] || CATEGORY_CONFIG.other;
                           const isHighlighted = selectedActivityId === activity.id;
                           const actIssues = conflictsForActivity(conflictReport.issues, activity.id);
                           const actWorst = worstSeverity(actIssues);
                           return (
-                            <div key={activity.id}
+                            <li
+                              key={activity.id}
                               className={`timeline__item ${isHighlighted ? 'timeline__item--highlighted' : ''}`}
+                              // Was a div with an onClick and nothing else: no
+                              // way to reach it by keyboard, and nothing to
+                              // announce. Selecting an activity centres the map
+                              // on it, so it is a real action and needs to be
+                              // one for everybody.
+                              tabIndex={0}
+                              role="button"
+                              aria-pressed={isHighlighted}
+                              aria-label={`${activity.title}${activity.start_time ? `, ${activity.start_time.slice(0, 5)}` : ''}${actIssues.length ? `, ${actIssues.length} issue${actIssues.length === 1 ? '' : 's'}` : ''}`}
                               onClick={() => setSelectedActivityId(activity.id)}
+                              onKeyDown={(e) => {
+                                if (e.key === 'Enter' || e.key === ' ') {
+                                  e.preventDefault();
+                                  setSelectedActivityId(activity.id);
+                                }
+                              }}
                             >
                               <div className="timeline__line">
                                 <div className="timeline__dot" style={{ background: cat.color }} />
@@ -1412,10 +1474,48 @@ export default function TripEditorPage({ params }) {
                                     {cat.icon} {cat.label}
                                   </span>
                                   <div className="activity-card__actions" hidden={isLocked}>
-                                    {idx > 0 && <button className="act-btn" onClick={(e) => { e.stopPropagation(); handleMoveActivity(activity.id, 'up'); }}>↑</button>}
-                                    {idx < selectedDayActivities.length - 1 && <button className="act-btn" onClick={(e) => { e.stopPropagation(); handleMoveActivity(activity.id, 'down'); }}>↓</button>}
-                                    <button className="act-btn" onClick={(e) => { e.stopPropagation(); openEditActivity(activity); }}>✏️</button>
-                                    <button className="act-btn act-btn--danger" onClick={(e) => { e.stopPropagation(); setDeletingActivity(activity); }}>🗑️</button>
+                                    {/* Every one of these was an unlabelled glyph.
+                                        A screen reader announced "up arrow,
+                                        button" with no idea what would move, or
+                                        read the emoji's own name — "pencil,
+                                        button". The glyphs are hidden from the
+                                        accessibility tree and the label carries
+                                        the meaning, including the position, so
+                                        the user knows where they are in the day. */}
+                                    {idx > 0 && (
+                                      <button
+                                        className="act-btn"
+                                        data-move={`up:${activity.id}`}
+                                        aria-label={`Move ${activity.title} earlier — currently ${idx + 1} of ${selectedDayActivities.length}`}
+                                        onClick={(e) => { e.stopPropagation(); handleMoveActivity(activity.id, 'up'); }}
+                                      >
+                                        <span aria-hidden="true">↑</span>
+                                      </button>
+                                    )}
+                                    {idx < selectedDayActivities.length - 1 && (
+                                      <button
+                                        className="act-btn"
+                                        data-move={`down:${activity.id}`}
+                                        aria-label={`Move ${activity.title} later — currently ${idx + 1} of ${selectedDayActivities.length}`}
+                                        onClick={(e) => { e.stopPropagation(); handleMoveActivity(activity.id, 'down'); }}
+                                      >
+                                        <span aria-hidden="true">↓</span>
+                                      </button>
+                                    )}
+                                    <button
+                                      className="act-btn"
+                                      aria-label={`Edit ${activity.title}`}
+                                      onClick={(e) => { e.stopPropagation(); openEditActivity(activity); }}
+                                    >
+                                      <span aria-hidden="true">✏️</span>
+                                    </button>
+                                    <button
+                                      className="act-btn act-btn--danger"
+                                      aria-label={`Delete ${activity.title}`}
+                                      onClick={(e) => { e.stopPropagation(); setDeletingActivity(activity); }}
+                                    >
+                                      <span aria-hidden="true">🗑️</span>
+                                    </button>
                                   </div>
                                 </div>
                                 <h3 className="activity-card__title">{activity.title}</h3>
@@ -1433,10 +1533,10 @@ export default function TripEditorPage({ params }) {
                                   </p>
                                 ))}
                               </div>
-                            </div>
+                            </li>
                           );
                         })}
-                      </div>
+                      </ol>
                     )}
                   </>
                 )}
@@ -1535,6 +1635,15 @@ export default function TripEditorPage({ params }) {
         isOpen={showExpenses}
         onClose={() => setShowExpenses(false)}
       />
+
+      {/* Reordering, replanning and generation all change the itinerary without
+          moving focus, which for a screen-reader user is silence. Polite so it
+          waits for a pause rather than interrupting; atomic so the whole
+          sentence is read rather than the diff. Visually hidden, not
+          display:none — the latter is not announced at all. */}
+      <div className="wf-sr-only" role="status" aria-live="polite" aria-atomic="true">
+        {announcement}
+      </div>
 
       {/* Mounted only while open, so the form re-seeds from the trip each time
           rather than needing an effect to reset it. */}
@@ -1702,8 +1811,17 @@ export default function TripEditorPage({ params }) {
         .main__empty h3 { font-size: var(--text-lg); margin: var(--space-2) 0 var(--space-1); }
         .main__empty p { color: var(--color-text-tertiary); font-size: var(--text-sm); }
 
-        .timeline { display: flex; flex-direction: column; }
+        /* list-style and the margin/padding reset because this is an <ol> now:
+           the semantics are for screen readers, not for numbering the page. */
+        .timeline { display: flex; flex-direction: column; list-style: none; margin: 0; padding: 0; }
         .timeline__item { display: flex; gap: var(--space-3); cursor: pointer; transition: all var(--transition-fast); }
+        /* The card is what the user sees, so put the focus ring on it rather
+           than tight around the flex row. */
+        .timeline__item:focus-visible { outline: none; }
+        .timeline__item:focus-visible .activity-card {
+          outline: 2px solid var(--color-border-focus);
+          outline-offset: 2px;
+        }
         .timeline__item--highlighted .activity-card { border-color: var(--color-primary); box-shadow: 0 0 0 2px rgba(var(--color-primary-rgb), 0.15); }
         .timeline__line { display: flex; flex-direction: column; align-items: center; width: 18px; flex-shrink: 0; padding-top: 18px; }
         .timeline__dot { width: 12px; height: 12px; border-radius: 50%; flex-shrink: 0; box-shadow: 0 0 0 3px var(--color-bg); }

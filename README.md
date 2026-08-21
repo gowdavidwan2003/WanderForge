@@ -1,116 +1,118 @@
 <p align="center">
-  <img src="https://img.shields.io/badge/Next.js-16.2-black?style=for-the-badge&logo=next.js" alt="Next.js" />
+  <img src="https://img.shields.io/badge/Next.js-16.2-black?style=for-the-badge&logo=next.js" alt="Next.js 16.2" />
   <img src="https://img.shields.io/badge/Supabase-PostgreSQL-3ECF8E?style=for-the-badge&logo=supabase" alt="Supabase" />
-  <img src="https://img.shields.io/badge/AI-Groq_Llama_3.3-F55036?style=for-the-badge&logo=meta" alt="Groq AI" />
-  <img src="https://img.shields.io/badge/Maps-Leaflet_+_Google_Routes-199900?style=for-the-badge&logo=leaflet" alt="Maps" />
+  <img src="https://img.shields.io/badge/AI-Groq_gpt--oss-F55036?style=for-the-badge" alt="Groq" />
+  <img src="https://img.shields.io/badge/License-MIT-blue?style=for-the-badge" alt="MIT" />
 </p>
 
-# 🧭 WanderForge — Forge Your Perfect Journey
+# 🧭 WanderForge
 
-An AI travel planner that only suggests things you can **actually do**. It plans day by day, checks the drive times against real roads, keeps the group in sync, and splits the bill at the end.
+**Most AI itineraries cannot actually be walked. This one checks.**
 
-Priority order, enforced in the AI prompt itself: **Achievable → Experience → Money.**
+A language model will happily put you on a mountain at 09:10 and in a restaurant
+across the valley at 09:30. It has no idea how long the road takes, and it will
+never tell you it guessed.
 
-<p align="center">
-  <img src="https://img.shields.io/badge/Status-Prototype-orange?style=flat-square" />
-  <img src="https://img.shields.io/badge/Production_Ready-4%2F10-red?style=flat-square" />
-  <img src="https://img.shields.io/badge/Pages-8-blue?style=flat-square" />
-  <img src="https://img.shields.io/badge/API_Routes-10-purple?style=flat-square" />
-  <img src="https://img.shields.io/badge/Migrations-6-informational?style=flat-square" />
-</p>
-
-> ⚠️ **Not production-ready.** Works well end-to-end, but several hard blockers remain.
-> See [Production Readiness](#-production-readiness) before deploying. Read it first.
+WanderForge measures every journey in a generated plan against real road
+distances *before the itinerary is saved*, flags the ones that do not fit the
+time allowed, and gives the model one chance to fix them. What survives is
+either achievable or explicitly marked as not.
 
 ---
 
-## ✨ Features
+## Contents
 
-### 🤖 AI planning that respects reality
-
-The generation prompt is built around one rule: **a plan that looks full but can't be executed is worthless.**
-
-- **Full-day itineraries** — 08:00 to ~21:00, contiguous, with all three meals at named venues
-- **Realistic travel time** — explicit speed models by terrain. Hill/ghat roads are 25–30 km/h, so a 40 km mountain road is 1.5 hours, not 30 minutes. Parking, walk-in and ticket queues are added on top
-- **Journeys are visible** — any hop over 45 minutes becomes its own `transport` entry, including the return leg
-- **Honest durations** — a peak trek is 3–5 hours *on the mountain* plus travel each way, and consumes the day it needs
-- **Fewer, achievable entries beat more, impossible ones** — the model is told to drop activities rather than compress travel
-
-### 🔄 Replanning at three scopes
-
-Adding one activity can't produce a coherent day, so replanning is explicit and shared by every entry point:
-
-| Scope | Trigger | What it does |
-|---|---|---|
-| **Day** | 🔄 Replan Day, or from the nearby picker | Rebuilds one day around everything on it |
-| **Day (auto)** | AI chat → Apply | Weaves requested places into the day |
-| **Whole trip** | Conflict checker *(currently disabled)* | Redistributes across days when a clash can't be fixed within one |
-
-**Nothing is ever silently lost.** Every replan validates that each place survives, and refuses to write if not:
-
-- Dropped places → confirmation listing exactly which
-- Two places merged into one entry → treated as a drop
-- Activities placed on a non-existent day → refused before any delete
-- One automatic repair pass re-prompts naming what went missing
-
-### 🗺️ Maps and routing
-
-- **Leaflet + CARTO Voyager** basemap, custom category-coloured numbered pins, route polylines
-- **Google Routes API** for real drive times, traffic-aware, with OpenRouteService fallback
-- **Google Places** for geocoding — finds venues OpenStreetMap can't ("The Planters Court"), with destination bias so results land in the right town
-- **Locate on Map** backfills coordinates for activities that lack them
-
-### 🧭 Nearby places picker
-
-Searches from the last mapped stop of the selected day. Seven categories, adjustable radius, Overpass primary with Google filling gaps. Added places carry their exact coordinates — no geocoding round-trip, no drifting pins.
-
-### 👥 Collaboration
-
-- **Invite → accept flow.** Invitations are pending until accepted; a pending invitee gets no access
-- **Shared trips appear on both dashboards** with a "Shared" badge
-- **Realtime sync** and presence via Supabase channels
-- **🔒 Itinerary lock** — the owner can freeze the plan. Enforced in RLS, not just the UI, with an owner-only database trigger so collaborators can't unlock themselves. **Bill splitting keeps working while locked**
-
-### 💰 Money
-
-- **Dynamic currency** — inferred from destination, confirmed by the AI, formatted properly (₹1,500 not USD 1500)
-- **Bill splitting** — equal, by exact amount, or by percentage, across any number of collaborators
-- **Simplify balances** — nets debts into the fewest transfers. A owes B 1000, B owes C 2000, C owes A 1000 collapses to **B pays C 1000**
-- **Bookings** — stays and transport, feeding the budget total, the PDF and the calendar export
-
-### 📤 Export
-
-PDF itinerary (with a bookings section), `.ics` calendar including stays as all-day events and transport as timed events, and a share link.
+- [What it does](#what-it-does)
+- [How the checking works](#how-the-checking-works)
+- [Running it](#running-it)
+- [Architecture](#architecture)
+- [Testing](#testing)
+- [Status](#status)
+- [Legal](#legal)
 
 ---
 
-## 🛠️ Tech Stack
+## What it does
 
-| Layer | Choice |
-|---|---|
-| Framework | Next.js 16.2 (App Router, Turbopack) · React 19 |
-| Database | Supabase Postgres — 12 tables, RLS on every one |
-| Auth | Supabase Auth + SSR cookies, middleware-gated routes |
-| AI | Groq `llama-3.3-70b-versatile`, JSON-mode, 3-key rotation |
-| Maps | Leaflet + CARTO tiles · Google Routes + Places · OpenRouteService fallback |
-| Places | Overpass (OSM) with Google Places fallback |
-| Weather | Open-Meteo |
-| Export | jsPDF · hand-built iCalendar |
+**Planning.** Describe a trip — destination, dates, interests, budget level, how
+you get around — and the AI plans it day by day. Days stream in as they are
+written, usually the first within two seconds, and you can stop it at any point.
 
-### Notable internals
+**Checking.** Before anything reaches the database, every consecutive pair of
+activities is measured. Overlaps, activities that end before they start, and
+journeys that do not fit the gap are found and named. Whatever cannot be fixed is
+flagged on the day it belongs to, next to the problem, with a one-click rebuild.
 
-| File | Why it exists |
-|---|---|
-| [`lib/itineraryPrompt.js`](src/lib/itineraryPrompt.js) | One realism ruleset shared by generate + replan, so they can't drift |
-| [`lib/groq.js`](src/lib/groq.js) | Key rotation. Rotates on rate limits only — a 400 fails fast rather than burning every key |
-| [`lib/settlement.js`](src/lib/settlement.js) | Balance netting + greedy min-transfer settlement |
-| [`lib/conflictChecker.js`](src/lib/conflictChecker.js) | Deterministic itinerary validation, no AI |
-| [`lib/replanTrip.js`](src/lib/replanTrip.js) | Whole-trip rebuild with the no-drop guarantees |
-| [`lib/withTimeout.js`](src/lib/withTimeout.js) | supabase-js queues behind token refresh; without a deadline a stalled refresh hangs the UI forever |
+**Collaboration.** Invite people to a trip and edits appear as they happen. The
+owner can freeze the itinerary once the group agrees; the freeze is enforced by
+database policy, not a disabled button.
+
+**Money.** Track spend against a budget in the destination's currency, then split
+shared costs and settle in the fewest transfers. Settlement is done in integer
+cents, so the balances reconcile exactly.
+
+**Taking it with you.** Export as PDF or as an `.ics` calendar file. Daily
+weather sits beside each day while you plan.
 
 ---
 
-## 🚀 Setup
+## How the checking works
+
+This is the part worth reading, because it is the part that is unusual.
+
+### The problem
+
+Ask any model for a five-day itinerary and it will produce something that reads
+beautifully and cannot be executed. It does not know that Chikmagaluru town to
+Mullayanagiri is 10 km in a straight line, 22 km by road, and 90 minutes of
+hairpins. Prompting harder does not fix it — a model asked to check its own
+arithmetic produces more confident output, not more correct output.
+
+### What we do instead
+
+1. **The model plans.** The prompt carries realism rules — road speeds by
+   terrain, parking and queue overheads, the return journey as its own entry —
+   which shape what it *chooses*, not what it *verifies*.
+
+2. **The output is validated.** A Zod schema coerces what can be repaired
+   (`"9am"` → `"09:00"`, `"₹1,200"` → `1200`, `"restaurant"` → `food`) and
+   rejects what cannot. Rejection is all-or-nothing, so a bad response can never
+   half-write a trip. On failure the model gets one retry holding the specific
+   errors.
+
+3. **Places are resolved.** Every location is geocoded server-side against a
+   shared 30-day cache, so a destination somebody has already planned costs
+   nothing to look up again.
+
+4. **The plan is measured.** `conflictChecker` walks each day pair by pair using
+   great-circle distance scaled for road sinuosity — a road more than twice the
+   crow-flight distance is switchbacking, and no flat-road average applies to it.
+
+5. **The model gets one chance to fix it.** Conflicts are quoted back verbatim
+   with a compact digest of the plan. The result is kept only if it is
+   *measurably* more achievable than what it replaced.
+
+6. **Survivors are recorded.** Remaining conflicts are stored with the trip and
+   shown in the editor. An unachievable plan is never silently saved as a normal
+   one.
+
+### What it cannot do
+
+Real opening hours, closures, weather on the day, road conditions, or whether a
+place still exists. Warnings about opening hours are inferred from the activity's
+category and are worth confirming, not obeying. Anything marked **impossible** is
+arithmetic — the journey does not fit the gap.
+
+---
+
+## Running it
+
+### Requirements
+
+- Node 20+
+- A Supabase project
+- A Groq API key (the free tier is enough)
+- A Google Maps Platform key with **Places API (New)** and **Routes API** enabled
 
 ### 1. Install
 
@@ -126,6 +128,8 @@ Create `.env.local`:
 # Supabase
 NEXT_PUBLIC_SUPABASE_URL=https://<project>.supabase.co
 NEXT_PUBLIC_SUPABASE_ANON_KEY=<anon key>
+# Required for the geocode cache to be written. Without it every place lookup
+# is billed, every time.
 SUPABASE_SERVICE_ROLE_KEY=<service role key>
 
 # Groq — tried in order, rotates on rate limit
@@ -134,29 +138,34 @@ GROQ_API_KEY_2=<key 2>   # optional
 GROQ_API_KEY_3=<key 3>   # optional
 
 # Google Maps — server-side only, never NEXT_PUBLIC_
-GOOGLE_MAPS_API_KEY=<key>   # needs Routes API + Places API (New)
+GOOGLE_MAPS_API_KEY=<key>
 
-# OpenRouteService — routing fallback
+# OpenRouteService — routing fallback, optional
 OPENROUTESERVICE_API_KEY=<key>
 
 NEXT_PUBLIC_APP_URL=http://localhost:3000
 ```
 
-> 🔐 `GOOGLE_MAPS_API_KEY` and all Groq keys are **secret** and must stay server-side.
-> Restrict the Maps key to the Routes and Places APIs, by IP.
+> `GOOGLE_MAPS_API_KEY` and every Groq key are secrets. None of them may be
+> prefixed `NEXT_PUBLIC_` — that ships them to the browser.
 
 ### 3. Migrations
 
-Run in order in the Supabase SQL editor:
+Run every file in `supabase/migrations/` **in numeric order** in the Supabase SQL
+editor. They are not optional and several are not backward compatible:
 
-| # | File | Adds |
-|---|---|---|
-| 001 | `001_initial_schema.sql` | Tables, RLS, storage |
-| 002 | `002_enable_realtime.sql` | Realtime, destination coords |
-| 003 | `003_fix_rls_recursion.sql` | `SECURITY DEFINER` helpers fixing policy recursion |
-| 004 | `004_collaboration_invites.sql` | Invite → accept, `get_my_invitations()` |
-| 005 | `005_expenses_and_currency.sql` | Expenses, equal/exact/percent splits, trip members |
-| 006 | `006_itinerary_lock.sql` | Itinerary lock + owner-only guard trigger |
+| Migration | Adds |
+|---|---|
+| `001`–`007` | Schema, RLS, collaboration, expenses, the itinerary lock |
+| `008` | Conflict storage on trips |
+| `009` | Shared geocode cache |
+| `010` | Atomic replan and atomic trip creation. **The app cannot create or replan without this.** |
+| `011` | Trip editing and delete-cascade verification. **Trip Settings cannot save without this.** |
+| `012` | RLS performance and index realignment |
+
+`010` also deletes trips that have no days — the orphans left by the old
+two-step creation. Read the block before running it if you have data you care
+about.
 
 ### 4. Run
 
@@ -166,19 +175,91 @@ npm run dev
 
 ---
 
-## 🗺️ Roadmap
+## Architecture
 
-- Re-enable the **itinerary conflict checker** (built, currently behind a "coming soon" panel)
-- Auth + rate limiting on all API routes
-- Resend SMTP for real invitations and verification
-- Offline mode (`idb` is installed, unused)
-- Drag-and-drop reordering (`@dnd-kit` installed, unused)
-- Budget analytics charts (`chart.js` installed, unused)
-- Photo uploads (`activity_photos` table and storage bucket exist, unused)
-- Post-trip journal and ratings (columns exist, unused)
+Everything with real logic lives in `src/lib/` as a pure module, so it can be
+tested without a browser, a database or an API key. The routes and components are
+thin wrappers around it.
+
+| Module | Responsibility |
+|---|---|
+| [`itineraryPrompt.js`](src/lib/itineraryPrompt.js) | The realism rules, and the one category normaliser every write path uses |
+| [`itinerarySchema.js`](src/lib/itinerarySchema.js) | The output contract. Coerces what it can, rejects what it cannot |
+| [`conflictChecker.js`](src/lib/conflictChecker.js) | Travel time, overlaps, odd hours, budget and distance |
+| [`conflictReport.js`](src/lib/conflictReport.js) | Bridges a generated plan into the checker, and names conflicts back to the model |
+| [`conflictView.js`](src/lib/conflictView.js) | Hard versus soft, grouped for the editor |
+| [`streamingJson.js`](src/lib/streamingJson.js) | Pulls whole days out of JSON that is still arriving |
+| [`placeLookup.js`](src/lib/placeLookup.js) | Batched, cached, deadline-bounded geocoding |
+| [`geocodeCache.js`](src/lib/geocodeCache.js) | The 30-day shared cache and its key derivation |
+| [`groq.js`](src/lib/groq.js) | Key rotation. Rotates on rate limits only — a 400 fails fast |
+| [`groqModels.js`](src/lib/groqModels.js) | Which model each workload uses, and how the token budget is sized |
+| [`aiBudget.js`](src/lib/aiBudget.js) | Divides the route's 60s ceiling across completions, geocoding and checking |
+| [`realtimeState.js`](src/lib/realtimeState.js) | Merges realtime payloads into local state instead of refetching |
+| [`settlement.js`](src/lib/settlement.js) | Integer-cent bill splitting |
+| [`tripDates.js`](src/lib/tripDates.js) | What changing a trip's dates does to its days |
+
+### Two constraints that shaped the design
+
+**Groq counts prompt plus reserved completion against one 8,000 token/minute
+allowance.** That is why generation is a single completion read incrementally
+rather than one request per day, and why retries carry a digest of the plan
+rather than the plan itself.
+
+**`response_format: json_object` buffers the entire completion.** Measured on a
+five-day itinerary: with JSON mode the first byte arrives at 6.4s and all 12KB
+lands in the following 3ms. Without it, the first byte is at 116ms and day one is
+on screen at 1.9s. The streaming path therefore does not use JSON mode and
+recovers the object from raw text; the non-streaming path keeps it.
 
 ---
 
-## 📄 License
+## Testing
 
-MIT
+```bash
+npm test          # once
+npm run test:watch
+```
+
+Vitest, Node environment, no jsdom — everything under test is pure logic. The
+suite covers the output contract against real model misbehaviour, the conflict
+checker's arithmetic, settlement (including a property test), the streaming
+parser at chunk sizes from one byte upward, and the date maths behind trip
+editing.
+
+---
+
+## Status
+
+Working end to end. Not audited, not load-tested, and not run against a real user
+base.
+
+**Known gaps**
+
+- The RLS performance work in `012` is unbenchmarked. `supabase/verify/012_rls_benchmark.sql`
+  seeds volume and measures it; nobody has run it yet.
+- Email invitations are stored but not sent — `resend` is a dependency with no
+  caller.
+- `chart.js`, `@dnd-kit` and `idb` are installed and unused. Budget charts,
+  drag-and-drop reordering and offline mode do not exist.
+- `trip_templates`, `reviews` and `activity_photos` are tables nothing reads or
+  writes.
+- No automated accessibility testing. The manual pass covered focus management,
+  keyboard reordering, contrast and reduced motion.
+
+---
+
+## Legal
+
+- [LICENSE](LICENSE) — MIT, covering the code.
+- [Privacy Policy](src/app/legal/privacy/page.js) — what is stored, and which of
+  the seven third-party services processes what. Served at `/legal/privacy`.
+- [Terms of Service](src/app/legal/terms/page.js) — served at `/legal/terms`.
+
+> Both documents are accurate about how the software behaves and **have not been
+> reviewed by a lawyer**. Each carries a note at the top listing what a deployment
+> must fill in — a named controller, a contact address, a governing jurisdiction —
+> before accepting a user who is not you.
+
+Deleting data: a trip is deleted from Trip Settings and takes its days,
+activities, bookings, expenses and invitations with it in one transaction.
+Account deletion is by request to the maintainer.

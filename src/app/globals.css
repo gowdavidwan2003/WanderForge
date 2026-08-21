@@ -17,10 +17,16 @@
 :root,
 [data-theme="light"] {
   /* Primary Palette */
-  --color-primary: #C17F3E;
-  --color-primary-light: #D4A574;
-  --color-primary-dark: #9E6630;
-  --color-primary-rgb: 193, 127, 62;
+  /* Every value below was measured, not eyeballed. The light theme's brand
+     colours were chosen against a cream background and then used as button
+     fills with white text, which is a different problem: #C17F3E behind white
+     is 3.30:1, well under AA's 4.5. Deepened until they pass against the
+     *darkest* light surface (--color-bg-tertiary), so no future combination can
+     quietly fail. The hue is unchanged; only the depth. */
+  --color-primary: #8B5B2D;        /* white on it 5.76:1, as text on bg 5.37:1 */
+  --color-primary-light: #C17F3E;  /* the old primary, now the decorative tint */
+  --color-primary-dark: #684422;
+  --color-primary-rgb: 139, 91, 45;
 
   /* Secondary */
   --color-secondary: #2D5016;
@@ -28,9 +34,9 @@
   --color-secondary-dark: #1E3A0E;
 
   /* Accent */
-  --color-accent: #C85A3A;
-  --color-accent-light: #E07652;
-  --color-accent-dark: #A84428;
+  --color-accent: #A64B30;         /* white on it 5.73:1, as text on bg 5.34:1 */
+  --color-accent-light: #C85A3A;
+  --color-accent-dark: #7E3924;
 
   /* Backgrounds */
   --color-bg: #FDF6EC;
@@ -43,7 +49,9 @@
   /* Text */
   --color-text: #2C1810;
   --color-text-secondary: #6B5744;
-  --color-text-tertiary: #8E7C6A;
+  /* Was #8E7C6A — 3.73:1 on --color-bg and 4.01:1 on white. This passes on all
+     four light surfaces, the tightest being bg-tertiary at 4.67:1. */
+  --color-text-tertiary: #706254;
   --color-text-inverse: #FDF6EC;
   --color-text-on-primary: #FFFFFF;
 
@@ -107,7 +115,10 @@
   /* Text */
   --color-text: #F0E6D3;
   --color-text-secondary: #B8A99A;
-  --color-text-tertiary: #8A7E72;
+  /* Was #8A7E72 — fine on --color-bg but 4.12:1 on --color-surface and 3.9 on
+     the elevated surface, which is where most tertiary text actually sits.
+     Tightest case now is surface-elevated at 4.67:1. */
+  --color-text-tertiary: #9D9389;
   --color-text-inverse: #1A1A2E;
   --color-text-on-primary: #1A1A2E;
 
@@ -482,5 +493,528 @@ img {
     --text-base: 1.125rem;
     --max-width: 1600px;
     --max-width-lg: 1800px;
+  }
+}
+
+/* ============================================
+   REDUCED MOTION
+   ============================================
+   Twenty-four `infinite` animations run across this app — floating orbs on the
+   landing page, the auth screens and the wizard, a pulsing badge, a bouncing
+   typing indicator. For a vestibular-disorder sufferer that is not decoration,
+   it is a page that cannot be looked at, and for everyone else on a laptop it is
+   a GPU that never idles.
+
+   Done globally rather than at each of the twenty-four call sites. Those live in
+   styled-jsx blocks in eleven different files, and a rule that has to be
+   remembered in every new component is a rule that will be forgotten. Anything
+   that genuinely needs motion to be understood can opt back in by name.
+
+   `0.01ms` rather than `none`: it keeps animationend/transitionend firing, so
+   any code waiting on one still proceeds instead of hanging forever. */
+@media (prefers-reduced-motion: reduce) {
+  *,
+  *::before,
+  *::after {
+    animation-duration: 0.01ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.01ms !important;
+    scroll-behavior: auto !important;
+  }
+
+  /* Spinners are the exception: a frozen spinner reads as a crashed page rather
+     than a calm one. Slowed to a rotation that carries no vestibular risk
+     instead of stopped. */
+  .wf-spinner__svg,
+  .gen__spinner {
+    animation-duration: 2s !important;
+    animation-iteration-count: infinite !important;
+  }
+
+  /* The compass pulse and the dash sweep inside the spinner are ornament on top
+     of the rotation, and stopping them costs nothing legible. */
+  .wf-spinner__circle,
+  .wf-spinner__compass {
+    animation: none !important;
+  }
+}
+
+/* ============================================
+   SKIP LINK
+   ============================================
+   Visible only when focused. Without it, a keyboard user tabs through the whole
+   header on every page before reaching the itinerary. */
+.wf-skip-link {
+  position: absolute;
+  left: var(--space-4);
+  top: -100%;
+  z-index: 9999;
+  padding: var(--space-3) var(--space-4);
+  border-radius: var(--radius-md);
+  background: var(--color-primary);
+  color: var(--color-text-on-primary);
+  font-weight: 600;
+  text-decoration: none;
+  transition: top var(--transition-fast);
+}
+
+.wf-skip-link:focus {
+  top: var(--space-4);
+}
+
+/* ============================================
+   FOCUS VISIBILITY
+   ============================================
+   Several components reset `outline: none` on buttons for looks. That is fine
+   for a mouse and leaves a keyboard user with no idea where they are, so put a
+   ring back on anything focused via the keyboard. :focus-visible rather than
+   :focus, so a clicked button does not sprout a ring. */
+:focus-visible {
+  outline: 2px solid var(--color-border-focus);
+  outline-offset: 2px;
+  border-radius: var(--radius-sm);
+}
+
+/* ============================================
+   VISUALLY HIDDEN
+   ============================================
+   For live regions and labels that exist only for assistive technology.
+   Deliberately not `display: none` or `visibility: hidden` — both remove the
+   element from the accessibility tree, so an announcement placed in one is
+   never announced. This keeps it in the tree and out of the picture. */
+.wf-sr-only {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  margin: -1px;
+  padding: 0;
+  overflow: hidden;
+  clip: rect(0, 0, 0, 0);
+  clip-path: inset(50%);
+  white-space: nowrap;
+  border: 0;
+}
+
+/* ============================================
+   LEGAL PAGES
+   ============================================
+   Long-form prose, so the constraints are different from the app: a measure
+   short enough to read, generous line height, and headings that separate. */
+.legal {
+  padding: var(--space-10) var(--space-4) var(--space-12);
+  background: var(--color-bg);
+}
+
+.legal__inner {
+  max-width: 68ch;
+  margin: 0 auto;
+  color: var(--color-text-secondary);
+  font-size: var(--text-base);
+  line-height: 1.7;
+}
+
+.legal__inner h1 {
+  font-family: var(--font-heading);
+  font-size: var(--text-3xl);
+  color: var(--color-text);
+  margin-bottom: var(--space-2);
+}
+
+.legal__inner h2 {
+  font-family: var(--font-heading);
+  font-size: var(--text-xl);
+  color: var(--color-text);
+  margin: var(--space-8) 0 var(--space-3);
+}
+
+.legal__inner p { margin-bottom: var(--space-4); }
+.legal__inner ul { margin: 0 0 var(--space-4) var(--space-5); }
+.legal__inner li { margin-bottom: var(--space-2); }
+.legal__inner strong { color: var(--color-text); }
+
+.legal__inner a {
+  color: var(--color-primary);
+  text-decoration: underline;
+  text-underline-offset: 2px;
+}
+
+.legal__meta {
+  font-size: var(--text-sm);
+  color: var(--color-text-tertiary);
+}
+
+.legal__lead {
+  font-size: var(--text-lg);
+  color: var(--color-text);
+  margin: var(--space-6) 0 var(--space-8);
+  padding-left: var(--space-4);
+  border-left: 3px solid var(--color-primary);
+}
+
+/* The processor table is the widest thing on the page and the one most likely
+   to be read on a phone. Scroll it rather than letting it push the layout. */
+.legal__table-wrap {
+  overflow-x: auto;
+  margin-bottom: var(--space-4);
+  border: 1px solid var(--color-border-light);
+  border-radius: var(--radius-md);
+}
+
+.legal__table {
+  width: 100%;
+  min-width: 560px;
+  border-collapse: collapse;
+  font-size: var(--text-sm);
+}
+
+.legal__table th,
+.legal__table td {
+  padding: var(--space-3);
+  text-align: left;
+  vertical-align: top;
+  border-bottom: 1px solid var(--color-border-light);
+}
+
+.legal__table thead th {
+  background: var(--color-bg-secondary);
+  color: var(--color-text);
+  font-weight: 600;
+  white-space: nowrap;
+}
+
+.legal__table tbody th {
+  color: var(--color-text);
+  font-weight: 600;
+  white-space: nowrap;
+}
+
+.legal__table tr:last-child th,
+.legal__table tr:last-child td { border-bottom: none; }
+
+.legal__nav {
+  margin-top: var(--space-10);
+  padding-top: var(--space-4);
+  border-top: 1px solid var(--color-border-light);
+  font-size: var(--text-sm);
+}
+
+/* ============================================
+   LANDING PAGE
+   ============================================
+   Styles live here rather than in a styled-jsx block because page.js is a server
+   component now — no client bundle, so no styled-jsx. That is the point of the
+   rewrite: the page renders from HTML alone.
+
+   No infinite animations. The previous version had roughly fifteen of them
+   (floating orbs, a pulsing dot, a bouncing scroll cue) plus an
+   IntersectionObserver revealing sections on scroll. For a motion-sensitive
+   visitor that is a page they cannot look at, and the reduced-motion rule above
+   can only suppress what exists. Not shipping it is better than hiding it. */
+
+.lp {
+  background: var(--color-bg);
+}
+
+/* ---- Hero ---- */
+.lp-hero {
+  padding: var(--space-12) 0 var(--space-10);
+  /* A single static gradient replaces three animated orbs. */
+  background:
+    radial-gradient(ellipse 80% 60% at 50% -20%, rgba(var(--color-primary-rgb), 0.16), transparent 70%),
+    var(--color-bg);
+}
+
+.lp-hero__inner { max-width: 62rem; }
+
+.lp-hero__eyebrow {
+  font-size: var(--text-sm);
+  font-weight: 600;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  color: var(--color-primary);
+  margin-bottom: var(--space-4);
+}
+
+.lp-hero__title {
+  font-family: var(--font-heading);
+  font-size: clamp(2rem, 6vw, 3.75rem);
+  line-height: 1.1;
+  color: var(--color-text);
+  margin-bottom: var(--space-5);
+  text-wrap: balance;
+}
+
+.lp-hero__strike {
+  color: var(--color-text-tertiary);
+  text-decoration: line-through;
+  text-decoration-thickness: 2px;
+}
+
+.lp-hero__sub {
+  font-size: var(--text-lg);
+  line-height: 1.6;
+  color: var(--color-text-secondary);
+  max-width: 46rem;
+  margin-bottom: var(--space-6);
+}
+
+.lp-hero__actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: var(--space-3);
+  margin-bottom: var(--space-10);
+}
+
+/* ---- Buttons (plain links, so no JS is needed to navigate) ---- */
+.lp-btn {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  padding: var(--space-3) var(--space-6);
+  border-radius: var(--radius-full);
+  font-weight: 600;
+  font-size: var(--text-base);
+  text-decoration: none;
+  border: 1px solid transparent;
+  transition: background var(--transition-fast), border-color var(--transition-fast);
+  /* Comfortably past the 44px minimum touch target. */
+  min-height: 48px;
+}
+
+.lp-btn--primary {
+  background: var(--color-primary);
+  color: var(--color-text-on-primary);
+}
+.lp-btn--primary:hover { background: var(--color-primary-dark); }
+
+.lp-btn--ghost {
+  background: transparent;
+  color: var(--color-text);
+  border-color: var(--color-border);
+}
+.lp-btn--ghost:hover { border-color: var(--color-primary); }
+
+.lp-btn--lg { padding: var(--space-4) var(--space-8); font-size: var(--text-lg); }
+
+/* ---- The worked example ---- */
+.lp-proof {
+  max-width: 34rem;
+  padding: var(--space-5);
+  border-radius: var(--radius-lg);
+  background: var(--color-surface);
+  border: 1px solid var(--color-border-light);
+  box-shadow: var(--shadow-md);
+}
+
+.lp-proof__label {
+  font-size: var(--text-xs);
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+  color: var(--color-text-tertiary);
+  margin-bottom: var(--space-3);
+}
+
+.lp-proof__row {
+  display: flex;
+  gap: var(--space-3);
+  padding: var(--space-2) 0;
+  font-size: var(--text-sm);
+  color: var(--color-text);
+  border-bottom: 1px solid var(--color-border-light);
+}
+
+.lp-proof__row--bad {
+  color: var(--color-error);
+  font-weight: 600;
+}
+
+.lp-proof__time {
+  font-variant-numeric: tabular-nums;
+  color: var(--color-text-tertiary);
+  flex-shrink: 0;
+}
+
+.lp-proof__verdict {
+  margin-top: var(--space-3);
+  font-size: var(--text-sm);
+  line-height: 1.5;
+  color: var(--color-text-secondary);
+}
+
+/* ---- Facts ---- */
+.lp-facts {
+  border-block: 1px solid var(--color-border-light);
+  background: var(--color-bg-secondary);
+}
+
+.lp-facts__inner {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(140px, 1fr));
+  gap: var(--space-6);
+  padding: var(--space-8) var(--space-4);
+}
+
+.lp-fact { text-align: center; }
+
+.lp-fact__num {
+  display: block;
+  font-family: var(--font-heading);
+  font-size: var(--text-3xl);
+  color: var(--color-primary);
+}
+
+.lp-fact__label {
+  font-size: var(--text-sm);
+  color: var(--color-text-secondary);
+}
+
+/* ---- Sections ---- */
+.lp-section { padding: var(--space-12) 0; }
+.lp-section--alt { background: var(--color-bg-secondary); }
+
+.lp-section__title {
+  font-family: var(--font-heading);
+  font-size: clamp(1.75rem, 4vw, 2.5rem);
+  color: var(--color-text);
+  margin-bottom: var(--space-3);
+  text-wrap: balance;
+}
+
+.lp-section__sub {
+  font-size: var(--text-lg);
+  color: var(--color-text-secondary);
+  margin-bottom: var(--space-8);
+}
+
+/* ---- Feature cards ---- */
+.lp-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(280px, 1fr));
+  gap: var(--space-5);
+  list-style: none;
+  margin: 0;
+  padding: 0;
+}
+
+.lp-card {
+  padding: var(--space-6);
+  border-radius: var(--radius-lg);
+  background: var(--color-surface);
+  border: 1px solid var(--color-border-light);
+  transition: border-color var(--transition-fast), transform var(--transition-fast);
+}
+
+.lp-card:hover {
+  border-color: var(--color-primary);
+  transform: translateY(-2px);
+}
+
+.lp-card__icon {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 44px;
+  height: 44px;
+  border-radius: var(--radius-md);
+  font-size: 22px;
+  margin-bottom: var(--space-4);
+}
+
+.lp-card__title {
+  font-family: var(--font-heading);
+  font-size: var(--text-lg);
+  color: var(--color-text);
+  margin-bottom: var(--space-2);
+}
+
+.lp-card__desc {
+  font-size: var(--text-sm);
+  line-height: 1.6;
+  color: var(--color-text-secondary);
+}
+
+/* ---- Steps ---- */
+.lp-steps {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(240px, 1fr));
+  gap: var(--space-6);
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  counter-reset: none;
+}
+
+.lp-step { display: flex; gap: var(--space-4); }
+
+.lp-step__num {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  flex-shrink: 0;
+  width: 36px;
+  height: 36px;
+  border-radius: var(--radius-full);
+  background: var(--color-primary);
+  color: var(--color-text-on-primary);
+  font-weight: 700;
+  font-family: var(--font-heading);
+}
+
+.lp-step__title {
+  font-size: var(--text-base);
+  color: var(--color-text);
+  margin-bottom: var(--space-1);
+}
+
+.lp-step__desc {
+  font-size: var(--text-sm);
+  line-height: 1.6;
+  color: var(--color-text-secondary);
+}
+
+/* ---- Close ---- */
+.lp-cta {
+  padding: var(--space-12) 0;
+  text-align: center;
+  background:
+    radial-gradient(ellipse 70% 80% at 50% 120%, rgba(var(--color-primary-rgb), 0.18), transparent 70%),
+    var(--color-bg);
+}
+
+.lp-cta__title {
+  font-family: var(--font-heading);
+  font-size: clamp(1.75rem, 5vw, 2.75rem);
+  color: var(--color-text);
+  margin-bottom: var(--space-3);
+}
+
+.lp-cta__sub {
+  font-size: var(--text-lg);
+  color: var(--color-text-secondary);
+  margin-bottom: var(--space-6);
+}
+
+@media (max-width: 640px) {
+  .lp-hero { padding: var(--space-8) 0 var(--space-6); }
+  .lp-section { padding: var(--space-8) 0; }
+  .lp-hero__actions .lp-btn { flex: 1 1 100%; }
+}
+
+/* ============================================
+   TOUCH TARGETS
+   ============================================
+   The navigation and footer links are ~26px tall — enough for WCAG 2.5.8's 24px
+   minimum, and tight for a thumb. Widened on coarse pointers only, so the
+   desktop layout is untouched: adding this unconditionally would space the
+   footer columns out for people who are not going to mis-tap anything.
+
+   Padding rather than min-height, because these are inline links inside flex
+   columns and a min-height would not centre the text. */
+@media (pointer: coarse) {
+  .navbar__link,
+  .footer__links a {
+    display: flex;
+    align-items: center;
+    min-height: 44px;
   }
 }
