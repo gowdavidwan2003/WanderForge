@@ -54,6 +54,12 @@ export default function NewTripPage() {
     currency: 'AUTO',
     travelStyle: '',
     notes: '',
+    // On by default: somebody in the "plan a trip with AI" wizard almost
+    // certainly wants the AI to plan it, and making them press a second button
+    // on an empty screen was a step with no decision in it. Still a choice,
+    // because generation spends real quota and some people want to build a trip
+    // by hand.
+    autoGenerate: true,
   });
 
   const { user } = useAuth();
@@ -172,7 +178,24 @@ export default function NewTripPage() {
       if (!trip?.id) throw new Error('The trip was not created. Please try again.');
       console.log('[WanderForge] Trip created with', dayCount, 'days:', trip.id);
 
-      toast.success('Your trip has been created!', 'Trip Created 🎉');
+      // Handed over in sessionStorage rather than a query parameter. A `?generate=1`
+      // survives a refresh, and refreshing mid-generation would start a second
+      // one; this is read once and cleared. Scoped to the trip id so it can only
+      // ever fire for the trip that was just created.
+      if (formData.autoGenerate) {
+        try {
+          sessionStorage.setItem('wf-autogenerate', trip.id);
+        } catch {
+          // Private mode. The trip is still created; the user presses Generate.
+        }
+      }
+
+      toast.success(
+        formData.autoGenerate
+          ? 'Planning your itinerary now…'
+          : 'Your trip has been created!',
+        'Trip Created 🎉'
+      );
       router.push(`/trip/${trip.id}`);
     } catch (err) {
       console.error('[WanderForge] Create trip error:', err);
@@ -353,6 +376,21 @@ export default function NewTripPage() {
                 value={formData.notes}
                 onChange={(e) => updateForm('notes', e.target.value)}
               />
+
+              <label className="wizard__auto">
+                <input
+                  type="checkbox"
+                  checked={formData.autoGenerate}
+                  onChange={(e) => updateForm('autoGenerate', e.target.checked)}
+                />
+                <span>
+                  <strong>Plan it with AI straight away</strong>
+                  <span className="wizard__auto-hint">
+                    Days start appearing within a couple of seconds, and you can
+                    stop it at any point. Turn this off to build the trip yourself.
+                  </span>
+                </span>
+              </label>
             </div>
           )}
 
@@ -587,6 +625,27 @@ export default function NewTripPage() {
           border-color: var(--color-primary);
           background: rgba(var(--color-primary-rgb), 0.1);
           color: var(--color-primary);
+        }
+
+        .wizard__auto {
+          display: flex;
+          gap: var(--space-3);
+          align-items: flex-start;
+          padding: var(--space-4);
+          margin-top: var(--space-4);
+          border: 1px solid var(--color-border);
+          border-radius: var(--radius-md);
+          background: var(--color-bg-secondary);
+          cursor: pointer;
+        }
+        .wizard__auto input { margin-top: 3px; width: 18px; height: 18px; flex-shrink: 0; }
+        .wizard__auto strong { display: block; font-size: var(--text-sm); }
+        .wizard__auto-hint {
+          display: block;
+          margin-top: 2px;
+          font-size: var(--text-xs);
+          color: var(--color-text-tertiary);
+          line-height: 1.5;
         }
 
         .currency-label {
