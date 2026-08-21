@@ -16,6 +16,7 @@ export default function ProfilePage({ params }) {
   const [editing, setEditing] = useState(false);
   const [form, setForm] = useState({ display_name: '', bio: '' });
   const [apiKeyForm, setApiKeyForm] = useState({ groq: '' });
+  const [savingKey, setSavingKey] = useState(false);
   const [showApiSection, setShowApiSection] = useState(false);
 
   const { user } = useAuth();
@@ -50,18 +51,17 @@ export default function ProfilePage({ params }) {
 
       setTrips(tripsData || []);
 
-      // Fetch saved API keys
+      // Saved keys, via the API rather than the table. Migration 013 revokes
+      // the ciphertext column from client roles, and the hint is the only part
+      // of a key a browser is allowed to see.
       if (isOwnProfile) {
-        const { data: keys } = await supabase
-          .from('user_api_keys')
-          .select('provider')
-          .eq('user_id', id);
-        
-        if (keys?.length > 0) {
+        try {
+          const res = await fetch('/api/keys');
+          const body = await res.json();
           const keyMap = {};
-          keys.forEach(k => { keyMap[k.provider] = '••••••••'; });
-          setApiKeyForm(prev => ({ ...prev, ...keyMap }));
-        }
+          for (const k of body.keys || []) keyMap[k.provider] = k.key_hint || '••••';
+          setApiKeyForm((prev) => ({ ...prev, ...keyMap }));
+        } catch { /* the rest of the profile is still worth showing */ }
       }
     } catch {
       toast.error('Failed to load profile');
@@ -86,22 +86,51 @@ export default function ProfilePage({ params }) {
     }
   };
 
+  /**
+   * Save an API key.
+   *
+   * Goes to /api/keys, not to the table. Encryption has to happen on the server
+   * — the key that performs it cannot be in the browser — and this used to write
+   * the raw value straight into a column named `encrypted_key` under a comment
+   * saying it should be encrypted in production.
+   */
   const handleSaveApiKey = async (provider, key) => {
-    if (!key || key === '••••••••') return;
-    try {
-      const { error } = await supabase
-        .from('user_api_keys')
-        .upsert({
-          user_id: user.id,
-          provider,
-          encrypted_key: key, // In production, encrypt before storing
-        }, { onConflict: 'user_id,provider' });
+    // The masked hint is what is displayed when a key is already saved; sending
+    // it back would store the mask as the key.
+    if (!key || key.startsWith('••••')) return;
 
-      if (error) throw error;
-      toast.success(`${provider} API key saved`);
-      setApiKeyForm(prev => ({ ...prev, [provider]: '••••••••' }));
+    setSavingKey(true);
+    try {
+      const res = await fetch('/api/keys', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ provider, key }),
+      });
+      const body = await res.json();
+      if (!res.ok) throw new Error(body.error || 'Could not save the key');
+
+      // Replace what is on screen with the hint immediately, so the full key is
+      // not sitting in an input for the rest of the session.
+      setApiKeyForm((prev) => ({ ...prev, [provider]: body.key_hint }));
+      toast.success('Saved and encrypted. It is used for your own generations.', 'API key saved');
     } catch (err) {
       toast.error(err.message);
+    } finally {
+      setSavingKey(false);
+    }
+  };
+
+  const handleRemoveApiKey = async (provider) => {
+    setSavingKey(true);
+    try {
+      const res = await fetch(`/api/keys?provider=${provider}`, { method: 'DELETE' });
+      if (!res.ok) throw new Error((await res.json()).error || 'Could not remove the key');
+      setApiKeyForm((prev) => ({ ...prev, [provider]: '' }));
+      toast.success('Removed. Generations use the shared quota again.', 'API key removed');
+    } catch (err) {
+      toast.error(err.message);
+    } finally {
+      setSavingKey(false);
     }
   };
 
@@ -175,22 +204,52 @@ export default function ProfilePage({ params }) {
               </button>
               {showApiSection && (
                 <div className="api-keys-section">
+                  {/* Says what it does for the user, which is the honest reason
+                      to add one: Groq meters tokens per organisation, so the
+                      shared account supports about one generation at a time. A
+                      user's own key is their own allowance. */}
                   <p className="api-keys-desc">
-                    Bring Your Own Key for AI generation. Your keys are stored securely and never shared.
+                    Add your own Groq key and your generations run on your quota
+                    instead of the shared one — no waiting behind other people, and
+                    longer trips in one go. It is encrypted before it is stored,
+                    used only for your own requests, and never sent back to your
+                    browser.
                   </p>
                   <div className="api-key-row">
                     <div className="api-key-row__info">
                       <strong>Groq</strong>
-                      <span className="api-key-row__hint">Free tier available at console.groq.com</span>
+                      <span className="api-key-row__hint">
+                        Free key at console.groq.com
+                      </span>
                     </div>
                     <div className="api-key-row__input">
                       <Input
                         type="password"
                         placeholder="gsk_..."
+                        aria-label="Groq API key"
                         value={apiKeyForm.groq}
                         onChange={(e) => setApiKeyForm(p => ({ ...p, groq: e.target.value }))}
                       />
-                      <Button variant="primary" size="sm" onClick={() => handleSaveApiKey('groq', apiKeyForm.groq)}>Save</Button>
+                      <Button
+                        variant="primary"
+                        size="sm"
+                        loading={savingKey}
+                        disabled={savingKey || !apiKeyForm.groq || apiKeyForm.groq.startsWith('••••')}
+                        onClick={() => handleSaveApiKey('groq', apiKeyForm.groq)}
+                      >
+                        Save
+                      </Button>
+                      {apiKeyForm.groq.startsWith('••••') && (
+                        <Button
+                          variant="ghost"
+                          size="sm"
+                          loading={savingKey}
+                          disabled={savingKey}
+                          onClick={() => handleRemoveApiKey('groq')}
+                        >
+                          Remove
+                        </Button>
+                      )}
                     </div>
                   </div>
                 </div>
