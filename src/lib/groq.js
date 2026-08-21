@@ -230,3 +230,114 @@ export async function groqChatCompletion(body, { userApiKey, budgetMs = TOTAL_BU
     error: `The AI provider could not be used. ${[lastRateLimitError, lastTransportError].filter(Boolean).join('; ')}`.trim(),
   };
 }
+
+/**
+ * The same request, streamed.
+ *
+ * Returns the raw response body so the caller can read deltas as they arrive.
+ * Generation takes 15-40 seconds and used to show nothing until it was over;
+ * streaming is the one thing Groq is genuinely fastest at, and the first day of
+ * an itinerary lands in a couple of seconds.
+ *
+ * Key rotation works the same way, with one difference that matters: a stream
+ * can fail *after* the response headers say 200 — the connection drops
+ * mid-itinerary. Rotation cannot help there, because the caller has already
+ * begun rendering, so this only rotates on failures visible before the first
+ * byte of the body.
+ *
+ * @param signal aborts the upstream request when the browser goes away, so a
+ *               cancelled generation stops being billed rather than running to
+ *               completion into a socket nobody is reading.
+ * @returns {{ok: true, body: ReadableStream, keyIndex: number}
+ *          |{ok: false, status: number, error: string}}
+ */
+export async function groqChatCompletionStream(
+  body,
+  { userApiKey, budgetMs = TOTAL_BUDGET_MS, signal } = {}
+) {
+  const keys = groqKeys(userApiKey);
+
+  if (keys.length === 0) {
+    return {
+      ok: false,
+      status: 400,
+      error: 'No API key available. Add your own Groq key in Settings.',
+    };
+  }
+
+  let lastRateLimitError = null;
+  let lastTransportError = null;
+  const startedAt = Date.now();
+
+  for (let i = 0; i < keys.length; i++) {
+    const key = keys[i];
+
+    const slice = attemptBudgetMs(Date.now() - startedAt, budgetMs);
+    if (slice <= 0) {
+      return {
+        ok: false,
+        status: 504,
+        timedOut: true,
+        error: 'The AI provider did not respond in time. Please try again.',
+      };
+    }
+
+    let res;
+    try {
+      res = await fetch(GROQ_URL, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${key}` },
+        body: JSON.stringify({ ...body, stream: true }),
+        // No AbortController timeout on the whole request: that ceiling belongs
+        // to the *first byte*, and a stream legitimately stays open for far
+        // longer than any single completion would. The caller's signal is what
+        // ends it early.
+        signal,
+      });
+    } catch (err) {
+      if (err?.name === 'AbortError') {
+        return { ok: false, status: 499, aborted: true, error: 'Generation cancelled.' };
+      }
+      console.warn(
+        `[WanderForge] Groq stream key ${maskKey(key)} failed: ${err?.message} (${i + 1}/${keys.length}).`
+      );
+      lastTransportError = err?.message || 'Network error';
+      continue;
+    }
+
+    if (res.ok && res.body) {
+      if (i > 0) {
+        console.info(`[WanderForge] Groq stream key ${maskKey(key)} used after ${i} rate-limited key(s).`);
+      }
+      return { ok: true, body: res.body, keyIndex: i };
+    }
+
+    const payload = await res.json().catch(() => ({}));
+
+    if (isRateLimited(res.status, payload)) {
+      console.warn(
+        `[WanderForge] Groq stream key ${maskKey(key)} rate-limited (${i + 1}/${keys.length}), trying next.`
+      );
+      lastRateLimitError = payload?.error?.message || 'Rate limit reached';
+      continue;
+    }
+
+    console.error(
+      `[WanderForge] Groq stream failed with ${res.status} on key ${maskKey(key)}: ${payload?.error?.message || 'no message'}`
+    );
+    return {
+      ok: false,
+      status: res.status,
+      error: payload?.error?.message || `Groq API error: ${res.status}`,
+    };
+  }
+
+  return {
+    ok: false,
+    status: lastRateLimitError ? 429 : 503,
+    exhausted: Boolean(lastRateLimitError),
+    error: lastRateLimitError
+      ? `All ${keys.length} Groq key${keys.length === 1 ? '' : 's'} have hit their rate limit. ${lastRateLimitError}`.trim()
+      : `Could not reach the AI provider: ${lastTransportError}. Please try again.`,
+  };
+}

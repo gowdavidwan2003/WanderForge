@@ -23,11 +23,22 @@ import NearbyPlacesPanel from '@/components/trip/NearbyPlacesPanel';
 import BookingsPanel from '@/components/trip/BookingsPanel';
 import { bookingsTotal } from '@/lib/bookings';
 import { clearsExistingActivities, orderOffsetFor, planGeneration } from '@/lib/generationGuard';
-import { replanDay } from '@/lib/replanDay';
+import { replanDay, undoReplan } from '@/lib/replanDay';
 import { geocodeBatch, unresolvedLocations } from '@/lib/geocodeClient';
 import { checkItinerary } from '@/lib/conflictChecker';
 import { conflictsForActivity, dayConflictSummary, worstSeverity } from '@/lib/conflictView';
 import { normalizeCategory } from '@/lib/itineraryPrompt';
+import {
+  applyActivityEvent,
+  applyDayEvent,
+  createEchoFilter,
+  pickSelectedDay,
+  shapeTripPayload,
+} from '@/lib/realtimeState';
+import { fetchWeather as loadWeather } from '@/lib/weatherCache';
+import TripSettingsPanel from '@/components/trip/TripSettingsPanel';
+import GenerationProgress from '@/components/trip/GenerationProgress';
+import { readSSE } from '@/lib/streamingJson';
 
 const CATEGORY_CONFIG = {
   sightseeing: { icon: '🏛️', color: '#6366F1', label: 'Sightseeing' },
@@ -55,6 +66,16 @@ export default function TripEditorPage({ params }) {
   const [editingActivity, setEditingActivity] = useState(null);
   const [aiGenerating, setAiGenerating] = useState(false);
   const [aiProgress, setAiProgress] = useState(null);
+  // What the stream has produced so far. Preview only — nothing here is saved
+  // until the server's `complete` event arrives.
+  const [streaming, setStreaming] = useState(null);
+  // Spoken by the live region at the bottom of the editor. A reorder is a purely
+  // visual change otherwise: the list silently rearranges and a screen-reader
+  // user has no way to know whether the button did anything.
+  const [announcement, setAnnouncement] = useState('');
+  // Lets the Cancel button reach the in-flight request. Aborting closes the SSE
+  // connection, which the route treats as "stop paying Groq".
+  const generateAbortRef = useRef(null);
   const [pendingGenerate, setPendingGenerate] = useState(null);
   // Guards against a double-click landing before the aiGenerating state commits.
   const generatingRef = useRef(false);
@@ -68,9 +89,16 @@ export default function TripEditorPage({ params }) {
   const [locating, setLocating] = useState(null);
   const [showNearby, setShowNearby] = useState(false);
   const [showBookings, setShowBookings] = useState(false);
+  const [showSettings, setShowSettings] = useState(false);
+  const [savingTrip, setSavingTrip] = useState(false);
+  const [deletingTrip, setDeletingTrip] = useState(false);
   // The day_number currently being rebuilt, or null. A number rather than a
   // boolean so the panel can show the spinner on the day it belongs to.
   const [replanningDay, setReplanningDay] = useState(null);
+  // The snapshot of whichever day was replanned last, so it can be put back.
+  // Cleared once used, or when the day is changed by anything else.
+  const [lastReplan, setLastReplan] = useState(null);
+  const [undoing, setUndoing] = useState(false);
   const [togglingLock, setTogglingLock] = useState(false);
   const [stays, setStays] = useState([]);
   const [transport, setTransport] = useState([]);
@@ -80,11 +108,63 @@ export default function TripEditorPage({ params }) {
     latitude: '', longitude: '',
   });
 
-  // Real-time collaboration
-  const handleRealtimeUpdate = useCallback((table, event) => {
-    // Auto-refresh when collaborators make changes
-    fetchTripData();
+  /**
+   * Rows this tab just wrote, so their echoes can be skipped.
+   *
+   * Realtime delivers postgres_changes for the client's own writes. The merge
+   * below is idempotent so an echo is harmless, but it still repaints the
+   * timeline — 25 times during one AI Generate.
+   */
+  const echoes = useRef(createEchoFilter());
+
+  /**
+   * A mirror of the state a realtime event needs to read.
+   *
+   * The event handler is created once, so it cannot close over current state,
+   * and the two pieces it has to change together cannot both be reached through
+   * functional updaters. Kept in sync after every render.
+   */
+  const stateRef = useRef({ days: [], activities: {} });
+
+  /**
+   * Apply one realtime event to local state.
+   *
+   * This used to call fetchTripData() — three serial queries and a weather
+   * fetch — for every event, including every echo of this tab's own inserts.
+   * One AI Generate was roughly 125 requests. The payload already carries the
+   * whole row, so merging it costs nothing and gives the same answer.
+   */
+  const handleRealtimeUpdate = useCallback((table, event, row) => {
+    if (!row) return;
+    if (echoes.current.isEcho(row.id)) return;
+
+    if (table === 'activities') {
+      setActivities((prev) => applyActivityEvent(prev, event, row));
+      return;
+    }
+
+    if (table === 'trip_days') {
+      // A day event moves two pieces of state at once, and they have to agree —
+      // a new day needs its activity bucket, a deleted one must take its bucket
+      // with it. Read both from the mirror rather than nesting one setState
+      // updater inside another: updaters must be pure, and StrictMode runs them
+      // twice to prove it.
+      const { days: prevDays, activities: prevActs } = stateRef.current;
+      const merged = applyDayEvent(prevDays, prevActs, event, row);
+      setDays(merged.days);
+      setActivities(merged.activities);
+      setSelectedDay((current) => pickSelectedDay(merged.days, current));
+      return;
+    }
+
+    if (table === 'trips') {
+      setTrip((prev) => ({ ...prev, ...row }));
+    }
   }, []);
+
+  useEffect(() => {
+    stateRef.current = { days, activities };
+  });
 
   const { onlineUsers } = useRealtimeTrip(id, handleRealtimeUpdate, days.map(d => d.id));
 
@@ -92,6 +172,27 @@ export default function TripEditorPage({ params }) {
   const toast = useToast();
   const router = useRouter();
   const supabase = getSupabaseBrowserClient();
+
+  /**
+   * Weather follows the destination, not the itinerary.
+   *
+   * It used to be fetched from inside fetchTripData, so every realtime event
+   * re-fetched a forecast for coordinates that had not moved. The forecast
+   * depends on where the trip is and when — neither changes when somebody edits
+   * an activity — so this keys on the coordinates alone and reads a cached
+   * forecast when there is a fresh one.
+   */
+  useEffect(() => {
+    const lat = trip?.dest_lat;
+    const lng = trip?.dest_lng;
+    if (lat == null || lng == null) return;
+
+    let cancelled = false;
+    loadWeather(lat, lng).then((forecast) => {
+      if (!cancelled && forecast) setWeather(forecast);
+    });
+    return () => { cancelled = true; };
+  }, [trip?.dest_lat, trip?.dest_lng]);
 
   useEffect(() => {
     // Same trap as the dashboard: bailing out while auth is unresolved without
@@ -116,10 +217,13 @@ export default function TripEditorPage({ params }) {
     // trip_collaborators.user_id references auth.users, not profiles, so PostgREST
     // cannot embed profiles here — the old `select('*, profiles(...)')` returned
     // PGRST200 on every call and left the list permanently empty. Join manually.
-    const { data: rows, error } = await supabase
-      .from('trip_collaborators')
-      .select('*')
-      .eq('trip_id', id);
+    // withTimeout like every other load path: supabase-js queues queries behind
+    // an in-flight token refresh, and a refresh that never completes leaves the
+    // promise unsettled rather than rejected.
+    const { data: rows, error } = await withTimeout(
+      supabase.from('trip_collaborators').select('*').eq('trip_id', id),
+      'Loading collaborators'
+    );
 
     if (error) {
       console.error('[WanderForge] Failed to load collaborators:', error);
@@ -134,10 +238,10 @@ export default function TripEditorPage({ params }) {
     // No email: migration 007 revokes SELECT on that column from client roles,
     // because a world-readable email list is what let an attacker pick a victim
     // to impersonate. display_name is always populated by handle_new_user.
-    const { data: people } = await supabase
-      .from('profiles')
-      .select('id, display_name')
-      .in('id', rows.map(r => r.user_id));
+    const { data: people } = await withTimeout(
+      supabase.from('profiles').select('id, display_name').in('id', rows.map(r => r.user_id)),
+      'Loading collaborator names'
+    );
 
     const byId = Object.fromEntries((people || []).map(p => [p.id, p]));
     setCollaborators(rows.map(c => ({
@@ -148,17 +252,29 @@ export default function TripEditorPage({ params }) {
 
   const fetchBookings = async () => {
     const [a, t] = await Promise.all([
-      supabase.from('accommodations').select('*').eq('trip_id', id),
-      supabase.from('transport_bookings').select('*').eq('trip_id', id),
+      withTimeout(supabase.from('accommodations').select('*').eq('trip_id', id), 'Loading stays'),
+      withTimeout(supabase.from('transport_bookings').select('*').eq('trip_id', id), 'Loading transport'),
     ]);
     setStays(a.data || []);
     setTransport(t.data || []);
   };
 
+  /**
+   * Load the whole trip in one round trip.
+   *
+   * This was a waterfall: trip, then days, then activities, each awaiting the
+   * one before, plus a weather call — and it ran again on every realtime event.
+   * PostgREST can embed all three, and does the joining server-side.
+   */
   const fetchTripData = async () => {
     try {
-      const { data: tripData, error: tripErr } = await withTimeout(
-        supabase.from('trips').select('*').eq('id', id).single(),
+      const { data: row, error: tripErr } = await withTimeout(
+        supabase
+          .from('trips')
+          .select('*, trip_days(*, activities(*))')
+          .eq('id', id)
+          .order('day_number', { referencedTable: 'trip_days', ascending: true })
+          .single(),
         'Loading this trip'
       );
 
@@ -166,51 +282,26 @@ export default function TripEditorPage({ params }) {
       // rather than a failure: .single() reports no rows as PGRST116. Record it
       // and let the render throw notFound(), because notFound() called from this
       // async callback would escape the error boundary entirely.
-      if (tripErr?.code === 'PGRST116' || (!tripErr && !tripData)) {
+      if (tripErr?.code === 'PGRST116' || (!tripErr && !row)) {
         setMissing(true);
         return;
       }
 
       if (tripErr) throw tripErr;
-      setTrip(tripData);
 
-      const { data: daysData } = await supabase
-        .from('trip_days').select('*').eq('trip_id', id).order('day_number');
-      setDays(daysData || []);
-
-      if (daysData?.length > 0) {
-        if (!selectedDay) setSelectedDay(daysData[0]);
-
-        const dayIds = daysData.map(d => d.id);
-        const { data: actData } = await supabase
-          .from('activities').select('*').in('trip_day_id', dayIds).order('order_index');
-
-        const grouped = {};
-        daysData.forEach(d => { grouped[d.id] = []; });
-        (actData || []).forEach(a => {
-          if (grouped[a.trip_day_id]) grouped[a.trip_day_id].push(a);
-        });
-        setActivities(grouped);
-
-        // Fetch weather if we have destination coords
-        if (tripData.dest_lat && tripData.dest_lng) {
-          fetchWeather(tripData.dest_lat, tripData.dest_lng);
-        }
-      }
+      const shaped = shapeTripPayload(row);
+      setTrip(shaped.trip);
+      setDays(shaped.days);
+      setActivities(shaped.activities);
+      // Keeps the day the user is looking at, rather than snapping back to day 1
+      // every time anything reloads.
+      setSelectedDay((current) => pickSelectedDay(shaped.days, current));
     } catch {
       toast.error('Failed to load trip');
       router.push('/dashboard');
     } finally {
       setLoading(false);
     }
-  };
-
-  const fetchWeather = async (lat, lng) => {
-    try {
-      const res = await fetch(`/api/weather?lat=${lat}&lng=${lng}`);
-      const data = await res.json();
-      if (data.forecast) setWeather(data.forecast);
-    } catch { /* ignore */ }
   };
 
   // Geocode a place name, biased toward the trip's destination.
@@ -264,9 +355,74 @@ export default function TripEditorPage({ params }) {
    * broken day before you may fix it is exactly the friction the panel exists to
    * remove.
    */
+  /**
+   * Save an edited trip.
+   *
+   * The day list is reconciled in the same transaction as the trip fields, so a
+   * trip can never end up with days that disagree with its own dates. The panel
+   * has already shown the user what removing days costs.
+   */
+  const handleSaveTrip = async ({ form, plan }) => {
+    setSavingTrip(true);
+    try {
+      const { data, error } = await withTimeout(
+        supabase.rpc('update_trip_with_days', {
+          p_trip_id: id,
+          p_trip: {
+            title: form.title.trim(),
+            destination: form.destination.trim(),
+            start_date: form.startDate,
+            end_date: form.endDate,
+            transport_mode: form.transportMode,
+            // Present-but-empty clears it; the RPC distinguishes that from absent.
+            total_budget: form.totalBudget === '' ? null : String(form.totalBudget),
+          },
+          p_days: plan.days,
+        }),
+        'Saving your trip'
+      );
+      if (error) throw error;
+
+      setTrip((prev) => ({ ...prev, ...data }));
+      setShowSettings(false);
+      toast.success(
+        plan.removed.length
+          ? `Saved. ${plan.removed.length} day(s) outside the new dates were removed.`
+          : 'Your trip has been updated.',
+        'Trip Saved'
+      );
+      // Days changed shape, so this one does need a re-read — the RPC returns the
+      // trip row, not the reconciled day list.
+      fetchTripData();
+    } catch (err) {
+      toast.error(err.message || 'Could not save the trip', 'Save failed');
+    } finally {
+      setSavingTrip(false);
+    }
+  };
+
+  /** Delete the trip. Everything below it cascades in Postgres. */
+  const handleDeleteTrip = async () => {
+    setDeletingTrip(true);
+    try {
+      const { error } = await withTimeout(
+        supabase.from('trips').delete().eq('id', id),
+        'Deleting your trip'
+      );
+      if (error) throw error;
+
+      toast.success('The trip and everything on it has been deleted.', 'Trip Deleted');
+      router.push('/dashboard');
+    } catch (err) {
+      toast.error(err.message || 'Could not delete the trip', 'Delete failed');
+      setDeletingTrip(false);
+    }
+  };
+
   const handleReplanDay = async (day = selectedDay) => {
     if (blockedByLock() || !day) return;
     setReplanningDay(day.day_number);
+
     const result = await replanDay(supabase, {
       trip,
       day,
@@ -274,12 +430,44 @@ export default function TripEditorPage({ params }) {
     });
     setReplanningDay(null);
 
-    if (!result.ok) return toast.error(result.error, 'Replan failed');
+    // A failure now genuinely means nothing changed — the delete and the inserts
+    // are one transaction — so this can say so instead of leaving the user
+    // wondering what survived.
+    if (!result.ok) return toast.error(result.error, 'Replan failed — the day is unchanged');
+
+    applyDayWrite(day.id, result.activities);
+    setLastReplan({ dayId: day.id, dayNumber: day.day_number, undo: result.undo });
+
     toast.success(
-      `Day ${day.day_number} rebuilt — ${result.count} entries, times and travel sorted.`,
+      `Day ${day.day_number} rebuilt — ${result.count} entries, times and travel sorted. Use "Undo replan" if you preferred the old one.`,
       result.theme || 'Day Replanned'
     );
-    fetchTripData();
+  };
+
+  /** Put back the day as it was before the last replan. */
+  const handleUndoReplan = async () => {
+    if (blockedByLock() || !lastReplan) return;
+    setUndoing(true);
+    const result = await undoReplan(supabase, lastReplan.dayId, lastReplan.undo);
+    setUndoing(false);
+
+    if (!result.ok) return toast.error(result.error, 'Could not undo');
+
+    applyDayWrite(lastReplan.dayId, result.activities);
+    toast.success(`Day ${lastReplan.dayNumber} is back as it was.`, 'Replan undone');
+    setLastReplan(null);
+  };
+
+  /**
+   * Put the rows the server just returned straight into local state.
+   *
+   * The RPC returns what it wrote, so there is nothing to go back and read. The
+   * ids are registered as ours first, so the realtime echoes of this same write
+   * are ignored rather than repainting the timeline once per row.
+   */
+  const applyDayWrite = (dayId, rows = []) => {
+    echoes.current.remember(rows.map((r) => r.id));
+    setActivities((prev) => ({ ...prev, [dayId]: rows }));
   };
 
   /** Fix the day with this number, wherever the request came from. */
@@ -451,18 +639,57 @@ export default function TripEditorPage({ params }) {
     }
   };
 
+  /**
+   * Move one activity up or down its day.
+   *
+   * Reordering is the one editing action with no keyboard or screen-reader
+   * story: the buttons were labelled with bare arrow glyphs, the list silently
+   * rearranged, and focus was lost when the refetch replaced the row. All three
+   * are dealt with here — the button keeps focus by id (the DOM node is
+   * replaced, so focus cannot be restored by reference), and the result is
+   * spoken by the live region.
+   */
   const handleMoveActivity = async (activityId, direction) => {
     if (blockedByLock()) return;
     if (!selectedDay) return;
+
     const dayActs = [...(activities[selectedDay.id] || [])];
-    const idx = dayActs.findIndex(a => a.id === activityId);
+    const idx = dayActs.findIndex((a) => a.id === activityId);
     const newIdx = direction === 'up' ? idx - 1 : idx + 1;
-    if (newIdx < 0 || newIdx >= dayActs.length) return;
+    if (idx === -1 || newIdx < 0 || newIdx >= dayActs.length) return;
+
+    const moved = dayActs[idx];
     [dayActs[idx], dayActs[newIdx]] = [dayActs[newIdx], dayActs[idx]];
-    await Promise.all(dayActs.map((a, i) =>
-      supabase.from('activities').update({ order_index: i }).eq('id', a.id)
-    ));
-    fetchTripData();
+
+    // Locally first: the list reorders immediately rather than after a round
+    // trip, and the announcement describes what the user can already see.
+    const reordered = dayActs.map((a, i) => ({ ...a, order_index: i }));
+    setActivities((prev) => ({ ...prev, [selectedDay.id]: reordered }));
+    echoes.current.remember(reordered.map((a) => a.id));
+    setAnnouncement(
+      `${moved.title} moved to position ${newIdx + 1} of ${dayActs.length}.`
+    );
+
+    const results = await Promise.all(
+      reordered.map((a, i) =>
+        supabase.from('activities').update({ order_index: i }).eq('id', a.id)
+      )
+    );
+
+    const failed = results.filter((r) => r.error);
+    if (failed.length) {
+      toast.error(failed[0].error.message, 'Could not reorder');
+      setAnnouncement('The move could not be saved. The order has been restored.');
+      fetchTripData();
+      return;
+    }
+
+    // Focus follows the activity, not the position. Without this the button the
+    // user just pressed has moved and focus lands wherever React put it — which
+    // for a keyboard user means losing their place mid-reorder.
+    requestAnimationFrame(() => {
+      document.querySelector(`[data-move="${direction}:${activityId}"]`)?.focus();
+    });
   };
 
   // AI Generate itinerary
@@ -477,21 +704,16 @@ export default function TripEditorPage({ params }) {
    */
   const insertDayPlan = async (day, dayPlan, currency, orderOffset = 0, coords = new Map()) => {
     const acts = dayPlan?.activities || [];
-    let written = 0;
-    const failures = [];
+    if (acts.length === 0) return { written: 0, failures: [] };
 
-    for (let i = 0; i < acts.length; i++) {
-      const act = acts[i];
+    const rows = acts.map((act, i) => {
       // The server geocoded these already, to check travel times before anything
       // was written. Reusing its coordinates keeps the saved trip identical to
       // the one that was checked, and saves a billed lookup per activity.
       // `coords` covers whatever the server could not resolve, filled in by one
-      // batch call rather than a lookup per activity inside this loop.
+      // batch call rather than a lookup per activity inside a loop.
       const fallback = act.location_name ? coords.get(act.location_name) : null;
-      const lat = Number.isFinite(act.latitude) ? act.latitude : fallback?.lat ?? null;
-      const lng = Number.isFinite(act.longitude) ? act.longitude : fallback?.lng ?? null;
-
-      const { error } = await supabase.from('activities').insert({
+      return {
         trip_day_id: day.id,
         title: act.title,
         description: act.description || '',
@@ -504,16 +726,31 @@ export default function TripEditorPage({ params }) {
         booking_link: act.booking_link || '',
         order_index: orderOffset + i,
         currency: currency || trip.currency || 'USD',
-        latitude: lat,
-        longitude: lng,
-      });
+        latitude: Number.isFinite(act.latitude) ? act.latitude : fallback?.lat ?? null,
+        longitude: Number.isFinite(act.longitude) ? act.longitude : fallback?.lng ?? null,
+      };
+    });
 
-      if (error) failures.push(`${act.title}: ${error.message}`);
-      else written++;
-      setAiProgress((p) => (p ? { ...p, done: p.done + 1 } : p));
+    // One request per day, not per activity. A 25-activity generation was 25
+    // round trips here — and every one of them came back as a realtime event
+    // that triggered a full reload. It also makes a day all-or-nothing, which is
+    // now safe to rely on: every value was validated server-side against the
+    // same constraints Postgres enforces.
+    const { data: inserted, error } = await supabase.from('activities').insert(rows).select();
+
+    if (error) {
+      return { written: 0, failures: [`Day ${day.day_number}: ${error.message}`] };
     }
 
-    return { written, failures };
+    // Straight into local state, and registered as ours so the echoes of this
+    // write are ignored rather than repainting the timeline once per row.
+    applyDayWrite(
+      day.id,
+      orderOffset > 0 ? [...(activities[day.id] || []), ...(inserted || [])] : inserted || []
+    );
+    setAiProgress((p) => (p ? { ...p, done: p.done + rows.length } : p));
+
+    return { written: inserted?.length ?? 0, failures: [] };
   };
 
   /**
@@ -550,7 +787,8 @@ export default function TripEditorPage({ params }) {
         await supabase.from('trips').update({
           dest_lat: destGeo.lat, dest_lng: destGeo.lng,
         }).eq('id', trip.id);
-        fetchWeather(destGeo.lat, destGeo.lng);
+        // No explicit weather call: setting dest_lat/dest_lng on the trip row is
+        // what the weather effect keys on, so it follows on the next load.
       }
     }
   };
@@ -573,11 +811,16 @@ export default function TripEditorPage({ params }) {
     setPendingGenerate(null);
     setAiGenerating(true);
     setAiProgress({ phase: 'planning', done: 0, total: 0 });
+    setStreaming({ status: 'Starting…', days: [], expected: days.length });
+
+    const controller = new AbortController();
+    generateAbortRef.current = controller;
 
     try {
       const res = await fetch('/api/ai/generate', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
+        signal: controller.signal,
         body: JSON.stringify({
           destination: trip.destination,
           days: days.length,
@@ -591,12 +834,45 @@ export default function TripEditorPage({ params }) {
           destLat: trip.dest_lat,
           destLng: trip.dest_lng,
           totalBudget: trip.total_budget,
+          // Day-by-day, so the first one lands in a couple of seconds instead of
+          // forty. What gets saved is unchanged: the server still validates,
+          // geocodes and checks the whole plan before sending `complete`.
+          stream: true,
         }),
       });
 
-      const data = await res.json();
-      if (data.error) throw new Error(data.error);
-      if (!data.itinerary) throw new Error('No itinerary returned');
+      // A failure before the stream opens is still a JSON body.
+      if (!res.ok || !res.body) {
+        const failed = await res.json().catch(() => ({}));
+        throw new Error(failed.error || `Generation failed (${res.status})`);
+      }
+
+      let data = null;
+      let streamError = null;
+
+      for await (const { event, data: payload } of readSSE(res.body, { signal: controller.signal })) {
+        if (event === 'status') {
+          setStreaming((s) => ({ ...s, status: payload.message }));
+        } else if (event === 'day') {
+          setStreaming((s) => ({
+            ...s,
+            days: [...(s?.days || []), payload.day],
+            expected: payload.expected || s?.expected || 0,
+            status: `Day ${payload.day.day}: ${payload.day.theme || 'planned'}`,
+          }));
+        } else if (event === 'error') {
+          streamError = payload;
+        } else if (event === 'complete') {
+          data = payload;
+        }
+      }
+
+      // Cancelled. The route aborts its Groq request when this connection
+      // closes, and nothing has been written, so there is nothing to undo.
+      if (controller.signal.aborted) return;
+
+      if (streamError) throw new Error(streamError.message);
+      if (!data?.itinerary) throw new Error('No itinerary returned');
 
       const total = data.itinerary.reduce((s, d) => s + (d.activities?.length || 0), 0);
       if (total === 0) throw new Error('The AI returned an itinerary with no activities.');
@@ -612,10 +888,14 @@ export default function TripEditorPage({ params }) {
           // Abort rather than insert: a failed clear followed by a successful
           // insert reproduces exactly the duplication this guard exists to stop.
           if (error) throw new Error(`Could not clear the old itinerary: ${error.message}`);
+          // Local state has to follow, because nothing re-reads the trip after
+          // this any more — the inserts below return their own rows.
+          setActivities(Object.fromEntries(dayIds.map((dayId) => [dayId, []])));
         }
       }
 
       setAiProgress({ phase: 'saving', done: 0, total });
+      setStreaming((s) => ({ ...s, status: 'Saving your itinerary…' }));
 
       // One batch call for everything the server could not place, before the
       // write loop rather than inside it. This used to be a Places lookup per
@@ -666,14 +946,33 @@ export default function TripEditorPage({ params }) {
         );
       }
 
-      fetchTripData();
+      // No reconciling read. Every row written came back from the insert and is
+      // already on screen; re-reading 25 rows the browser just wrote is the
+      // pattern this whole ticket is about.
     } catch (err) {
-      toast.error(err.message, 'AI Generation Failed');
+      // An abort is a choice, not a failure, and must not be reported as one.
+      if (err?.name !== 'AbortError') toast.error(err.message, 'AI Generation Failed');
     } finally {
+      generateAbortRef.current = null;
       generatingRef.current = false;
       setAiGenerating(false);
       setAiProgress(null);
+      setStreaming(null);
     }
+  };
+
+  /**
+   * Stop a generation in flight.
+   *
+   * Closing the connection is what stops it: the route aborts its own request to
+   * Groq when the browser goes away, so a cancelled generation stops being
+   * billed rather than running to completion into a socket nobody is reading.
+   * Nothing has been written at this point, so there is nothing to roll back.
+   */
+  const handleCancelGenerate = () => {
+    if (!generateAbortRef.current) return;
+    generateAbortRef.current.abort();
+    toast.info('Generation stopped. Your itinerary is unchanged.', 'Cancelled');
   };
 
   const handleAIGenerate = () => {
@@ -766,7 +1065,6 @@ export default function TripEditorPage({ params }) {
           'Filled, but not fully achievable'
         );
       }
-      fetchTripData();
     } catch (err) {
       toast.error(err.message, 'AI Fill Failed');
     } finally {
@@ -867,6 +1165,13 @@ export default function TripEditorPage({ params }) {
                       : 'Freeze the itinerary so nobody can change it',
                   },
                   {
+                    key: 'settings',
+                    label: 'Trip Settings',
+                    icon: '⚙️',
+                    onClick: () => setShowSettings(true),
+                    title: 'Edit the title, dates, destination, budget or transport — or delete the trip',
+                  },
+                  {
                     key: 'nearby',
                     label: 'Find Nearby',
                     icon: '🧭',
@@ -904,11 +1209,15 @@ export default function TripEditorPage({ params }) {
                   key: 'ai-generate',
                   // A silent multi-minute run is what makes people click again,
                   // so say which phase it is in and how far along.
+                  // The panel below carries the detail now; this just has to
+                  // stop looking like a button worth pressing again.
                   label: !aiGenerating
                     ? 'AI Generate'
                     : aiProgress?.phase === 'saving' && aiProgress.total
                       ? `Saving ${aiProgress.done}/${aiProgress.total}`
-                      : 'Planning your trip...',
+                      : streaming?.days?.length
+                        ? `Day ${streaming.days.length} of ${streaming.expected || '?'}`
+                        : 'Planning...',
                   icon: '🤖',
                   onClick: handleAIGenerate,
                   loading: aiGenerating,
@@ -1023,6 +1332,19 @@ export default function TripEditorPage({ params }) {
                             <span className="weather-badge__desc">{selectedDayWeather.description}</span>
                           </div>
                         )}
+                        {lastReplan?.dayId === selectedDay.id && (
+                          <Button
+                            variant="ghost"
+                            size="sm"
+                            onClick={handleUndoReplan}
+                            loading={undoing}
+                            disabled={undoing || isLocked}
+                            icon={<span>↩</span>}
+                            title="Put this day back exactly as it was before the replan"
+                          >
+                            Undo replan
+                          </Button>
+                        )}
                         {selectedDayActivities.length > 0 && (
                           <Button
                             variant="ghost"
@@ -1043,6 +1365,21 @@ export default function TripEditorPage({ params }) {
                         </Button>
                       </div>
                     </div>
+
+                    {/* Days appear here as the model writes them, so the first
+                        one lands in a couple of seconds instead of forty. It is a
+                        preview — nothing is written until the server finishes
+                        checking the whole plan. */}
+                    {aiGenerating && streaming && (
+                      <GenerationProgress
+                        status={streaming.status}
+                        phase={aiProgress?.phase === 'saving' ? 'saving' : 'planning'}
+                        streamedDays={streaming.days || []}
+                        expected={streaming.expected}
+                        saved={aiProgress?.phase === 'saving' ? aiProgress : null}
+                        onCancel={handleCancelGenerate}
+                      />
+                    )}
 
                     {/* The whole point of S2-3: an impossible day says so where the
                         day is, with the fix next to the problem — not behind a
@@ -1097,16 +1434,35 @@ export default function TripEditorPage({ params }) {
                         </div>
                       </div>
                     ) : (
-                      <div className="timeline">
+                      // An ordered list, because the order is the meaning: a
+                      // screen reader now says "list, 8 items, item 3 of 8"
+                      // instead of reading eight unrelated groups.
+                      <ol className="timeline" aria-label={`Day ${selectedDay.day_number} itinerary`}>
                         {selectedDayActivities.map((activity, idx) => {
                           const cat = CATEGORY_CONFIG[activity.category] || CATEGORY_CONFIG.other;
                           const isHighlighted = selectedActivityId === activity.id;
                           const actIssues = conflictsForActivity(conflictReport.issues, activity.id);
                           const actWorst = worstSeverity(actIssues);
                           return (
-                            <div key={activity.id}
+                            <li
+                              key={activity.id}
                               className={`timeline__item ${isHighlighted ? 'timeline__item--highlighted' : ''}`}
+                              // Was a div with an onClick and nothing else: no
+                              // way to reach it by keyboard, and nothing to
+                              // announce. Selecting an activity centres the map
+                              // on it, so it is a real action and needs to be
+                              // one for everybody.
+                              tabIndex={0}
+                              role="button"
+                              aria-pressed={isHighlighted}
+                              aria-label={`${activity.title}${activity.start_time ? `, ${activity.start_time.slice(0, 5)}` : ''}${actIssues.length ? `, ${actIssues.length} issue${actIssues.length === 1 ? '' : 's'}` : ''}`}
                               onClick={() => setSelectedActivityId(activity.id)}
+                              onKeyDown={(e) => {
+                                if (e.key === 'Enter' || e.key === ' ') {
+                                  e.preventDefault();
+                                  setSelectedActivityId(activity.id);
+                                }
+                              }}
                             >
                               <div className="timeline__line">
                                 <div className="timeline__dot" style={{ background: cat.color }} />
@@ -1118,10 +1474,48 @@ export default function TripEditorPage({ params }) {
                                     {cat.icon} {cat.label}
                                   </span>
                                   <div className="activity-card__actions" hidden={isLocked}>
-                                    {idx > 0 && <button className="act-btn" onClick={(e) => { e.stopPropagation(); handleMoveActivity(activity.id, 'up'); }}>↑</button>}
-                                    {idx < selectedDayActivities.length - 1 && <button className="act-btn" onClick={(e) => { e.stopPropagation(); handleMoveActivity(activity.id, 'down'); }}>↓</button>}
-                                    <button className="act-btn" onClick={(e) => { e.stopPropagation(); openEditActivity(activity); }}>✏️</button>
-                                    <button className="act-btn act-btn--danger" onClick={(e) => { e.stopPropagation(); setDeletingActivity(activity); }}>🗑️</button>
+                                    {/* Every one of these was an unlabelled glyph.
+                                        A screen reader announced "up arrow,
+                                        button" with no idea what would move, or
+                                        read the emoji's own name — "pencil,
+                                        button". The glyphs are hidden from the
+                                        accessibility tree and the label carries
+                                        the meaning, including the position, so
+                                        the user knows where they are in the day. */}
+                                    {idx > 0 && (
+                                      <button
+                                        className="act-btn"
+                                        data-move={`up:${activity.id}`}
+                                        aria-label={`Move ${activity.title} earlier — currently ${idx + 1} of ${selectedDayActivities.length}`}
+                                        onClick={(e) => { e.stopPropagation(); handleMoveActivity(activity.id, 'up'); }}
+                                      >
+                                        <span aria-hidden="true">↑</span>
+                                      </button>
+                                    )}
+                                    {idx < selectedDayActivities.length - 1 && (
+                                      <button
+                                        className="act-btn"
+                                        data-move={`down:${activity.id}`}
+                                        aria-label={`Move ${activity.title} later — currently ${idx + 1} of ${selectedDayActivities.length}`}
+                                        onClick={(e) => { e.stopPropagation(); handleMoveActivity(activity.id, 'down'); }}
+                                      >
+                                        <span aria-hidden="true">↓</span>
+                                      </button>
+                                    )}
+                                    <button
+                                      className="act-btn"
+                                      aria-label={`Edit ${activity.title}`}
+                                      onClick={(e) => { e.stopPropagation(); openEditActivity(activity); }}
+                                    >
+                                      <span aria-hidden="true">✏️</span>
+                                    </button>
+                                    <button
+                                      className="act-btn act-btn--danger"
+                                      aria-label={`Delete ${activity.title}`}
+                                      onClick={(e) => { e.stopPropagation(); setDeletingActivity(activity); }}
+                                    >
+                                      <span aria-hidden="true">🗑️</span>
+                                    </button>
                                   </div>
                                 </div>
                                 <h3 className="activity-card__title">{activity.title}</h3>
@@ -1139,10 +1533,10 @@ export default function TripEditorPage({ params }) {
                                   </p>
                                 ))}
                               </div>
-                            </div>
+                            </li>
                           );
                         })}
-                      </div>
+                      </ol>
                     )}
                   </>
                 )}
@@ -1241,6 +1635,33 @@ export default function TripEditorPage({ params }) {
         isOpen={showExpenses}
         onClose={() => setShowExpenses(false)}
       />
+
+      {/* Reordering, replanning and generation all change the itinerary without
+          moving focus, which for a screen-reader user is silence. Polite so it
+          waits for a pause rather than interrupting; atomic so the whole
+          sentence is read rather than the diff. Visually hidden, not
+          display:none — the latter is not announced at all. */}
+      <div className="wf-sr-only" role="status" aria-live="polite" aria-atomic="true">
+        {announcement}
+      </div>
+
+      {/* Mounted only while open, so the form re-seeds from the trip each time
+          rather than needing an effect to reset it. */}
+      {showSettings && (
+      <TripSettingsPanel
+        isOpen={showSettings}
+        onClose={() => setShowSettings(false)}
+        trip={trip}
+        days={days}
+        activities={activities}
+        onSave={handleSaveTrip}
+        onDelete={handleDeleteTrip}
+        saving={savingTrip}
+        deleting={deletingTrip}
+        // Editors may change a trip; only the owner may destroy it.
+        canDelete={isOwner}
+      />
+      )}
 
       <ConflictCheckPanel
         isOpen={showConflicts}
@@ -1390,8 +1811,17 @@ export default function TripEditorPage({ params }) {
         .main__empty h3 { font-size: var(--text-lg); margin: var(--space-2) 0 var(--space-1); }
         .main__empty p { color: var(--color-text-tertiary); font-size: var(--text-sm); }
 
-        .timeline { display: flex; flex-direction: column; }
+        /* list-style and the margin/padding reset because this is an <ol> now:
+           the semantics are for screen readers, not for numbering the page. */
+        .timeline { display: flex; flex-direction: column; list-style: none; margin: 0; padding: 0; }
         .timeline__item { display: flex; gap: var(--space-3); cursor: pointer; transition: all var(--transition-fast); }
+        /* The card is what the user sees, so put the focus ring on it rather
+           than tight around the flex row. */
+        .timeline__item:focus-visible { outline: none; }
+        .timeline__item:focus-visible .activity-card {
+          outline: 2px solid var(--color-border-focus);
+          outline-offset: 2px;
+        }
         .timeline__item--highlighted .activity-card { border-color: var(--color-primary); box-shadow: 0 0 0 2px rgba(var(--color-primary-rgb), 0.15); }
         .timeline__line { display: flex; flex-direction: column; align-items: center; width: 18px; flex-shrink: 0; padding-top: 18px; }
         .timeline__dot { width: 12px; height: 12px; border-radius: 50%; flex-shrink: 0; box-shadow: 0 0 0 3px var(--color-bg); }

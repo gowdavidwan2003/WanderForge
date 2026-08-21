@@ -4,8 +4,18 @@ import { useEffect, useState, useCallback, useRef } from 'react';
 import { getSupabaseBrowserClient } from '@/lib/supabase/client';
 
 /**
- * Hook for real-time trip collaboration
- * Subscribes to changes on trips, trip_days, and activities
+ * Real-time trip collaboration.
+ *
+ * Subscribes to trips, trip_days and activities for one trip, and hands each
+ * event's row to onUpdate. The caller is expected to MERGE that row into local
+ * state — not to re-read the trip. Refetching on every event turned a
+ * 25-activity generation into roughly 125 requests, most of them re-reading rows
+ * the same browser had just written.
+ *
+ * onUpdate is held in a ref, so a caller that rebuilds the callback on every
+ * render does not tear down and rebuild the socket subscription with it.
+ *
+ * @param onUpdate (table, eventType, row) => void
  */
 export function useRealtimeTrip(tripId, onUpdate, dayIds = []) {
   const [presenceState, setPresenceState] = useState({});
@@ -15,6 +25,13 @@ export function useRealtimeTrip(tripId, onUpdate, dayIds = []) {
   // Stable id for this browser tab, so each client gets its own presence key.
   // Generated inside the effect below — randomness during render is impure.
   const presenceKeyRef = useRef(null);
+
+  // Resubscribing whenever the parent re-creates its callback would drop and
+  // re-establish the socket on every keystroke.
+  const onUpdateRef = useRef(onUpdate);
+  useEffect(() => {
+    onUpdateRef.current = onUpdate;
+  });
 
   // Join by value so the effect re-subscribes when the trip's days finish loading.
   const dayIdKey = dayIds.join(',');
@@ -38,20 +55,32 @@ export function useRealtimeTrip(tripId, onUpdate, dayIds = []) {
       },
     });
 
-    // Realtime filters only support comparisons against literal values — the old
-    // `in.(select ...)` subquery was never valid, so activity changes never arrived.
-    // Subscribe unfiltered (RLS still limits what we receive) and match locally.
-    tripChannel
-      .on(
+    // Realtime filters only support comparisons against literal values, so
+    // `in.(select ...)` was never valid and activity changes never arrived at
+    // all. Subscribing unfiltered fixed that but made every client receive every
+    // activity change in the database and discard almost all of them locally —
+    // RLS decides what we may see, not what is worth sending.
+    //
+    // One listener per day, each filtered server-side on trip_day_id, is the only
+    // filter this table supports (activities has no trip_id column). Trips are
+    // capped at 30 days, so this is at most 30 listeners on one socket.
+    for (const dayId of currentDayIds) {
+      tripChannel.on(
         'postgres_changes',
-        { event: '*', schema: 'public', table: 'activities' },
+        {
+          event: '*',
+          schema: 'public',
+          table: 'activities',
+          filter: `trip_day_id=eq.${dayId}`,
+        },
         (payload) => {
           const row = payload.new || payload.old;
-          if (!row) return;
-          if (currentDayIds.length && !currentDayIds.includes(row.trip_day_id)) return;
-          onUpdate?.('activities', payload.eventType, row);
+          if (row) onUpdateRef.current?.('activities', payload.eventType, row);
         }
-      )
+      );
+    }
+
+    tripChannel
       .on(
         'postgres_changes',
         {
@@ -61,7 +90,7 @@ export function useRealtimeTrip(tripId, onUpdate, dayIds = []) {
           filter: `trip_id=eq.${tripId}`,
         },
         (payload) => {
-          onUpdate?.('trip_days', payload.eventType, payload.new || payload.old);
+          onUpdateRef.current?.('trip_days', payload.eventType, payload.new || payload.old);
         }
       )
       .on(
@@ -73,7 +102,7 @@ export function useRealtimeTrip(tripId, onUpdate, dayIds = []) {
           filter: `id=eq.${tripId}`,
         },
         (payload) => {
-          onUpdate?.('trips', 'UPDATE', payload.new);
+          onUpdateRef.current?.('trips', 'UPDATE', payload.new);
         }
       )
       // Presence tracking

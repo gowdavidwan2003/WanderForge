@@ -56,7 +56,9 @@ export default function Navbar() {
               <>
                 <a href="#features" className="navbar__link">Features</a>
                 <a href="#how-it-works" className="navbar__link">How It Works</a>
-                <a href="#templates" className="navbar__link">Templates</a>
+                {/* Was href="#templates" — an anchor no page has ever had, so
+                    the link did nothing at all. Explore is the page it meant. */}
+                <Link href="/explore" className="navbar__link">Destinations</Link>
               </>
             )}
           </div>

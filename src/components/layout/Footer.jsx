@@ -1,3 +1,5 @@
+'use client';
+
 import Link from 'next/link';
 
 export default function Footer() {
@@ -22,30 +24,53 @@ export default function Footer() {
                 </div>
                 <p className="footer__tagline text-accent">Forge your perfect journey</p>
                 <p className="footer__desc">
-                  AI-powered collaborative trip planning that optimizes your travel 
-                  experience, saves time, and maximizes every moment.
+                  AI trip planning that checks its own work: every itinerary is
+                  measured against real road distances before it is saved.
                 </p>
               </div>
 
               <div className="footer__links">
                 <h4 className="footer__heading">Product</h4>
-                <Link href="/explore">Explore Trips</Link>
+                <Link href="/explore">Explore Destinations</Link>
                 <Link href="/trip/new">Plan a Trip</Link>
-                <Link href="/explore">Templates</Link>
+                <Link href="/dashboard">My Trips</Link>
               </div>
 
+              {/* These three used to point at "/" — links that looked like
+                  documents and were the homepage. They were removed rather than
+                  faked, and are back now that each one resolves to something
+                  real. */}
               <div className="footer__links">
-                <h4 className="footer__heading">Company</h4>
-                <Link href="/">About</Link>
-                <Link href="/">Privacy Policy</Link>
-                <Link href="/">Terms of Service</Link>
+                <h4 className="footer__heading">Legal</h4>
+                <Link href="/legal/privacy">Privacy Policy</Link>
+                <Link href="/legal/terms">Terms of Service</Link>
+                <a
+                  href="https://github.com/gowdavidwan2003/WanderForge/blob/main/LICENSE"
+                  target="_blank"
+                  rel="noopener noreferrer"
+                >
+                  MIT License
+                </a>
               </div>
 
               <div className="footer__links">
                 <h4 className="footer__heading">Connect</h4>
-                <a href="https://twitter.com" target="_blank" rel="noopener noreferrer">Twitter</a>
-                <a href="https://github.com" target="_blank" rel="noopener noreferrer">GitHub</a>
-                <a href="mailto:hello@wanderforge.app">Contact Us</a>
+                {/* Was twitter.com and github.com — the sites themselves, not
+                    this project on them. */}
+                <a
+                  href="https://github.com/gowdavidwan2003/WanderForge"
+                  target="_blank"
+                  rel="noopener noreferrer"
+                >
+                  Source on GitHub
+                </a>
+                <a
+                  href="https://github.com/gowdavidwan2003/WanderForge/issues"
+                  target="_blank"
+                  rel="noopener noreferrer"
+                >
+                  Report a Problem
+                </a>
               </div>
             </div>
 
