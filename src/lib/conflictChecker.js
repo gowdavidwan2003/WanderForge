@@ -25,6 +25,32 @@ const OVERHEAD_MIN = { walking: 0, bike: 5, public_transit: 8, car: 12, flight: 
 
 const SEVERITY_RANK = { error: 0, warning: 1, info: 2 };
 
+/**
+ * How far short a transition may fall before it is worth mentioning.
+ *
+ * Every estimate here is great-circle distance times a road factor, at a fixed
+ * average speed. Being three minutes short of that is not a finding, it is the
+ * error bar — and a checker that reports it teaches people to skim past the
+ * warnings that matter. Ten minutes is comfortably outside the noise and still
+ * well inside anything that would actually derail a day.
+ */
+export const TRAVEL_TOLERANCE_MIN = 10;
+
+/**
+ * A transport entry IS the journey, not a place you travel to.
+ *
+ * REALISM_RULES instructs the model to give any hop over 45 minutes its own
+ * entry — "Drive back to Chikmagalur, 17:45-19:15" — and the checker then
+ * measured the gap BEFORE that entry and demanded it cover the drive. So a plan
+ * that allowed 90 minutes for a 34-minute journey was reported as 19 minutes
+ * short, and the system flagged the model for obeying its own instruction.
+ *
+ * The shape is: place A (13:00-14:00) → travel (14:00-15:00) → place B
+ * (15:00-16:00). The transition is the middle entry. There is nothing to check
+ * on either side of it except walking to the car.
+ */
+const isTransport = (a) => a?.category === 'transport';
+
 export function haversineKm(lat1, lng1, lat2, lng2) {
   const R = 6371;
   const toRad = (d) => (d * Math.PI) / 180;
@@ -135,7 +161,10 @@ export function checkItinerary(trip, days = [], activities = {}, roadLegs = {}) 
       // --- Opening-hour plausibility ---
       // Real opening hours aren't available, so this flags times that are
       // implausible for the activity category rather than asserting a closure.
-      if (start != null) {
+      // Opening hours are a statement about venues. A 05:00 departure or a
+      // 23:45 arrival is an ordinary way to drive, so transport is exempt from
+      // both ends of this.
+      if (start != null && !isTransport(a)) {
         const cat = a.category;
         if (start < 6 * 60) {
           add({
@@ -154,7 +183,10 @@ export function checkItinerary(trip, days = [], activities = {}, roadLegs = {}) 
           });
         }
       }
-      if (end != null && end > 23 * 60 + 30 && a.category !== 'nightlife' && a.category !== 'accommodation') {
+      if (
+        end != null && end > 23 * 60 + 30 &&
+        !isTransport(a) && a.category !== 'nightlife' && a.category !== 'accommodation'
+      ) {
         add({
           severity: 'warning', type: 'odd-hours', day: day.day_number,
           activityId: a.id, title: a.title,
@@ -186,10 +218,14 @@ export function checkItinerary(trip, days = [], activities = {}, roadLegs = {}) 
       const effectiveKm = roadKm ?? km * ROAD_FACTOR;
       dayDistance += effectiveKm;
 
+      // The distance is still travelled, so it still counts toward the day's
+      // total — only the per-leg warnings are suppressed below.
+      if (isTransport(a) || isTransport(prev)) continue;
+
       const needed = travelMinutes(km, mode, roadKm, realMinutes);
       const available = start - prevEnd;
 
-      if (km > 0.3 && available < needed) {
+      if (km > 0.3 && needed - available > TRAVEL_TOLERANCE_MIN) {
         const basis = realMinutes
           ? `${roadKm ? roadKm.toFixed(1) + ' km by road' : 'the route'}, which routing puts at ${fmt(Math.round(realMinutes))} of driving`
           : roadKm
