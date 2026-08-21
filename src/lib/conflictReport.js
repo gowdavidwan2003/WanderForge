@@ -126,7 +126,7 @@ export function conflictRetryPrompt(issues = [], itinerary = []) {
     '',
     digest,
     '',
-    'It was checked against real road distances and driving times, and these transitions do not work:',
+    'It was checked against estimated road distances and driving times, and these transitions do not work:',
     '',
     ...lines,
     '',

@@ -7,13 +7,13 @@ import Navbar from '@/components/layout/Navbar';
 export const metadata = {
   title: 'WanderForge — Trip plans that check their own work',
   description:
-    'An AI travel planner that measures every journey against real road distances before it saves your itinerary, so a day it gives you is a day you can actually walk. Plan together in real time, split the bills, export to PDF or your calendar.',
+    'An AI travel planner that works out how long every journey really takes — road distance, your transport mode, parking and walk-in time — before it saves your itinerary, so a day it gives you is a day you can actually walk. Plan together in real time, split the bills, export to PDF or your calendar.',
   keywords:
     'travel planner, AI itinerary, trip planning, collaborative travel, travel time checker, budget travel',
   openGraph: {
     title: 'WanderForge — Trip plans that check their own work',
     description:
-      'Every itinerary is checked against real road distances before it is saved. Plan together, split the bills, take it with you.',
+      'Every journey is checked for whether it fits the time allowed, before the itinerary is saved. Plan together, split the bills, take it with you.',
     type: 'website',
     siteName: 'WanderForge',
   },
