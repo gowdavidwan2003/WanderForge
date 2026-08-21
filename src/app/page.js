@@ -27,7 +27,7 @@ import { TEMPLATE_COUNT } from '@/lib/templates';
 export const metadata = {
   title: 'WanderForge — Trip plans that check their own work',
   description:
-    'An AI travel planner that measures every journey against real road distances before it saves your itinerary. Plan together in real time, split the bills, export to PDF or your calendar.',
+    'An AI travel planner that works out how long every journey really takes before it saves your itinerary. Plan together in real time, split the bills, export to PDF or your calendar.',
 };
 
 const FEATURES = [
@@ -35,7 +35,7 @@ const FEATURES = [
     icon: '🔍',
     title: 'It checks its own work',
     // src/lib/conflictChecker.js, wired into generation and the editor.
-    desc: 'Every plan is measured against real road distances before it is saved. A day that cannot be walked says so — on the day, next to the problem, with a one-click fix.',
+    desc: 'Before a plan is saved, every journey is costed out — road distance, your transport mode, and the time lost to parking and queues. A day that cannot be walked says so, on the day, next to the problem, with a one-click fix.',
     accent: 'var(--color-primary)',
   },
   {
@@ -132,9 +132,10 @@ export default function LandingPage() {
 
             <p className="lp-hero__sub">
               A model will happily put you on a mountain at 09:10 and in a
-              restaurant across the valley at 09:30. WanderForge measures every
-              journey against real road distances before your itinerary is saved,
-              and tells you which ones will not work.
+              restaurant across the valley at 09:30. WanderForge works out how
+              long every journey really takes — road distance, your transport mode, parking
+              and walk-in time — before your itinerary is saved, and tells you
+              which ones will not work.
             </p>
 
             <div className="lp-hero__actions">
@@ -146,21 +147,26 @@ export default function LandingPage() {
               </Link>
             </div>
 
-            {/* A concrete example beats an adjective. These are the real numbers
-                the checker uses for this route. */}
+            {/* Verbatim from the product, not an illustration of it. The first
+                version of this block quoted the *real* road figures for this
+                route — 22 km of hairpins, 1h20 — which the checker does not
+                currently use, so the example on the landing page was one the
+                shipped app would have stayed silent about. If this example ever
+                stops matching what the editor prints, the example is wrong. */}
             <div className="lp-proof">
               <p className="lp-proof__label">What that looks like</p>
               <div className="lp-proof__row">
-                <span className="lp-proof__time">09:00</span>
+                <span className="lp-proof__time">08:00 – 09:00</span>
                 <span className="lp-proof__what">Breakfast in Chikmagaluru town</span>
               </div>
               <div className="lp-proof__row lp-proof__row--bad">
-                <span className="lp-proof__time">09:30</span>
+                <span className="lp-proof__time">09:15</span>
                 <span className="lp-proof__what">Mullayanagiri Peak</span>
               </div>
               <p className="lp-proof__verdict">
-                <span aria-hidden="true">⛔</span> Only 30m between them, but the
-                road is 22 km of hairpins — about 1h20 by car. Short by 50m.
+                <span aria-hidden="true">⛔</span> Only 15m between them, but the
+                journey is about 13 km (estimated) — roughly 34m by car. Short by
+                19m.
               </p>
             </div>
           </div>

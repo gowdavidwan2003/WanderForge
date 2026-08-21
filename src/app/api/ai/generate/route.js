@@ -37,7 +37,7 @@ export const maxDuration = 60;
  * Trimmed of the hand-tuned "then verify each day hour by hour, is there enough
  * time to get from A to B" arithmetic that used to live here. A language model
  * cannot reliably do that arithmetic, and asking it to only made the output more
- * confident, not more correct. conflictChecker does it with real road distances
+ * confident, not more correct. conflictChecker does it deterministically, from road distance and mode speeds,
  * after the fact, and names what it finds back to the model — see below. The
  * realism *rules* stay (in REALISM_RULES) because they shape what the model
  * chooses; the self-marking does not.
@@ -186,7 +186,7 @@ async function finishPlan(raw, {
     geo = await geocodeItinerary(plan.itinerary, { near, deadlineAt: budget.deadlineAt(), cache });
   }
 
-  onStatus('Checking every journey against real road distances…');
+  onStatus('Working out how long each journey really takes…');
   let check = checkGeneratedItinerary(geo.itinerary, tripShape);
 
   const conflictPrompt = conflictRetryPrompt(check.issues, geo.itinerary);
