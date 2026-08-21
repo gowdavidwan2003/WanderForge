@@ -50,30 +50,43 @@ export const ACTIVITY_CATEGORIES = [
  */
 const CATEGORY_SYNONYMS = {
   meal: 'food', meals: 'food', dining: 'food', restaurant: 'food', cafe: 'food',
-  breakfast: 'food', lunch: 'food', dinner: 'food', drinks: 'food',
+  breakfast: 'food', lunch: 'food', dinner: 'food', drinks: 'food', coffee: 'food',
   viewpoint: 'sightseeing', landmark: 'sightseeing', monument: 'sightseeing',
+  sight: 'sightseeing', tour: 'sightseeing', attraction: 'sightseeing',
   temple: 'culture', museum: 'culture', heritage: 'culture', historical: 'culture',
+  history: 'culture', church: 'culture', religious: 'culture', art: 'culture',
   trekking: 'adventure', trek: 'adventure', hiking: 'adventure', hike: 'adventure',
-  safari: 'adventure', trail: 'adventure',
+  safari: 'adventure', trail: 'adventure', sport: 'adventure',
   leisure: 'relaxation', rest: 'relaxation', spa: 'relaxation', wellness: 'relaxation',
-  market: 'shopping', shop: 'shopping', bazaar: 'shopping',
+  downtime: 'relaxation',
+  market: 'shopping', shop: 'shopping', bazaar: 'shopping', souvenir: 'shopping',
   travel: 'transport', drive: 'transport', flight: 'transport', commute: 'transport',
+  driving: 'transport', train: 'transport', transfer: 'transport',
   hotel: 'accommodation', stay: 'accommodation', lodging: 'accommodation',
+  checkin: 'accommodation',
   scenic: 'nature', wildlife: 'nature', outdoors: 'nature', park: 'nature',
-  bar: 'nightlife', club: 'nightlife',
+  outdoor: 'nature', garden: 'nature', beach: 'nature',
+  bar: 'nightlife', club: 'nightlife', party: 'nightlife', entertainment: 'nightlife',
+};
+
+/** Look a single word up in both tables. */
+const lookup = (word) => {
+  if (!word) return null;
+  if (ACTIVITY_CATEGORIES.includes(word)) return word;
+  if (CATEGORY_SYNONYMS[word]) return CATEGORY_SYNONYMS[word];
+  // "markets", "sights", "drinks" — a plural of something already known.
+  const singular = word.replace(/s$/, '');
+  if (ACTIVITY_CATEGORIES.includes(singular)) return singular;
+  return CATEGORY_SYNONYMS[singular] || null;
 };
 
 export function normalizeCategory(value) {
   const raw = String(value ?? '').toLowerCase().trim();
-  if (ACTIVITY_CATEGORIES.includes(raw)) return raw;
-  if (CATEGORY_SYNONYMS[raw]) return CATEGORY_SYNONYMS[raw];
 
-  // "food/drink", "food & drink", "Food - Dining" all start with a usable word.
-  const first = raw.split(/[^a-z]+/).filter(Boolean)[0];
-  if (ACTIVITY_CATEGORIES.includes(first)) return first;
-  if (CATEGORY_SYNONYMS[first]) return CATEGORY_SYNONYMS[first];
-
-  return 'other';
+  // "food/drink", "food & drink", "Food - Dining" all start with a usable word,
+  // and so does "sightseeing|food|transport" — the format string echoed back
+  // instead of a choice being made from it.
+  return lookup(raw) || lookup(raw.split(/[^a-z]+/).filter(Boolean)[0]) || 'other';
 }
 
 /**

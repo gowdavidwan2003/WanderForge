@@ -1,4 +1,6 @@
+import { geocodeBatch } from '@/lib/geocodeClient';
 import { normalizeCategory } from '@/lib/itineraryPrompt';
+
 /**
  * Re-plan one day and write it back.
  *
@@ -53,13 +55,32 @@ export async function replanDay(supabase, { trip, day, keep = [], mustInclude = 
   }
 
   // Reuse coordinates we already hold for places whose names survive the replan,
-  // so re-planning a day does not re-geocode everything it kept.
+  // so re-planning a day does not re-geocode everything it kept. Keyed on both
+  // title and location_name: a replan usually rewrites the title ("Lunch at
+  // Town Canteen" → "Late lunch") while keeping the place, and matching on title
+  // alone was paying Google again for a place already on screen.
   const knownCoords = new Map();
+  const remember = (key, a) => {
+    if (key) knownCoords.set(String(key).trim().toLowerCase(), { lat: a.latitude, lng: a.longitude });
+  };
   for (const a of keep) {
     if (a.latitude != null && a.longitude != null) {
-      knownCoords.set(String(a.title).toLowerCase(), { lat: a.latitude, lng: a.longitude });
+      remember(a.title, a);
+      remember(a.location_name, a);
     }
   }
+
+  const coordsFor = (act) =>
+    knownCoords.get(String(act.title ?? '').trim().toLowerCase()) ||
+    knownCoords.get(String(act.location_name ?? '').trim().toLowerCase()) ||
+    null;
+
+  // Everything still unresolved, in one batched cache-backed request rather than
+  // a lookup awaited inside the write loop below.
+  const resolved = await geocodeBatch(
+    plan.activities.filter((a) => !coordsFor(a)).map((a) => a.location_name),
+    trip?.dest_lat != null ? { lat: trip.dest_lat, lng: trip.dest_lng } : null
+  );
 
   // Only clear the day once a valid plan is in hand.
   const { error: delErr } = await supabase
@@ -69,19 +90,8 @@ export async function replanDay(supabase, { trip, day, keep = [], mustInclude = 
   const failures = [];
   for (let i = 0; i < plan.activities.length; i++) {
     const act = plan.activities[i];
-    let coords = knownCoords.get(String(act.title).toLowerCase()) || null;
-
-    if (!coords && act.location_name) {
-      try {
-        const params = new URLSearchParams({ q: act.location_name });
-        if (trip?.dest_lat != null) {
-          params.set('lat', trip.dest_lat);
-          params.set('lng', trip.dest_lng);
-        }
-        const geo = await (await fetch(`/api/geocode?${params}`)).json();
-        if (geo.results?.[0]) coords = { lat: geo.results[0].lat, lng: geo.results[0].lng };
-      } catch { /* placing it without coordinates beats failing the whole replan */ }
-    }
+    // Placing an activity without coordinates beats failing the whole replan.
+    const coords = coordsFor(act) || resolved.get(act.location_name) || null;
 
     const { error } = await supabase.from('activities').insert({
       trip_day_id: day.id,

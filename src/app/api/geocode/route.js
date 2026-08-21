@@ -1,72 +1,25 @@
 import { NextResponse } from 'next/server';
 import { requireUser } from '@/lib/api/requireUser';
+import { lookupPlace, resolvePlaces } from '@/lib/placeLookup';
+import { normaliseQuery } from '@/lib/geocodeCache';
+import { getGeocodeCacheClients } from '@/lib/api/geocodeCacheClients';
 
 /**
  * Place lookup for activity locations.
  *
- * Nominatim geocodes addresses, not businesses — it could not find "The Planters
- * Court", "Hirekolale Lake" or even "Chikmagaluru" (OSM indexes that city as
- * "Chikmagalur"), which left every activity on a trip without coordinates.
- * Google Places Text Search handles venue names and spelling variants, so it is
- * tried first, with Nominatim kept as a no-key fallback.
+ * The provider logic lives in @/lib/placeLookup so the generate route can resolve
+ * coordinates server-side before the conflict checker runs — the checker cannot
+ * judge travel time between two places it has no coordinates for.
+ *
+ * GET  resolves one query, for interactive lookups.
+ * POST resolves many at once, cache-first. Every client loop that used to await
+ *      one GET per activity should use it: at ~$0.032 a Places call, a 5-day
+ *      itinerary geocoded one activity at a time is around $1.30 that a batch
+ *      against a warm cache costs nothing.
  */
 
-async function googlePlaces(apiKey, query, near) {
-  const body = { textQuery: query, maxResultCount: 1 };
-
-  // Bias toward the trip's destination so "District Museum" resolves near the
-  // right town rather than to a same-named place on the other side of the country.
-  if (near?.lat != null && near?.lng != null) {
-    body.locationBias = {
-      circle: {
-        center: { latitude: near.lat, longitude: near.lng },
-        radius: 50000,
-      },
-    };
-  }
-
-  const res = await fetch('https://places.googleapis.com/v1/places:searchText', {
-    method: 'POST',
-    headers: {
-      'Content-Type': 'application/json',
-      'X-Goog-Api-Key': apiKey,
-      'X-Goog-FieldMask': 'places.displayName,places.location,places.formattedAddress',
-    },
-    body: JSON.stringify(body),
-  });
-
-  if (!res.ok) throw new Error(`Google Places ${res.status}`);
-
-  const data = await res.json();
-  const place = data.places?.[0];
-  if (!place?.location) return null;
-
-  return {
-    name: place.formattedAddress || place.displayName?.text || query,
-    lat: place.location.latitude,
-    lng: place.location.longitude,
-    type: 'place',
-    source: 'google',
-  };
-}
-
-async function nominatim(query) {
-  const res = await fetch(
-    `https://nominatim.openstreetmap.org/search?q=${encodeURIComponent(query)}&format=json&limit=5&addressdetails=1`,
-    { headers: { 'User-Agent': 'WanderForge/1.0' } }
-  );
-  if (!res.ok) throw new Error('Geocoding failed');
-
-  const data = await res.json();
-  return data.map((item) => ({
-    name: item.display_name,
-    lat: parseFloat(item.lat),
-    lng: parseFloat(item.lon),
-    type: item.type,
-    address: item.address,
-    source: 'nominatim',
-  }));
-}
+/** Refuse absurd batches rather than letting one request run up a bill. */
+const MAX_BATCH = 60;
 
 export async function GET(request) {
   // These routes spend the operator's Google and Groq quota, so they must
@@ -88,21 +41,51 @@ export async function GET(request) {
       ? { lat: nearLat, lng: nearLng }
       : null;
 
-  const googleKey = process.env.GOOGLE_MAPS_API_KEY;
-
-  if (googleKey) {
-    try {
-      const hit = await googlePlaces(googleKey, query, near);
-      if (hit) return NextResponse.json({ results: [hit], source: 'google' });
-    } catch (err) {
-      console.warn('[WanderForge] Google Places unavailable, trying Nominatim:', err.message);
-    }
-  }
-
   try {
-    const results = await nominatim(query);
-    return NextResponse.json({ results, source: 'nominatim' });
+    const cache = await getGeocodeCacheClients();
+    const { results, source } = await lookupPlace(query, near, { cache });
+    return NextResponse.json({ results, source });
   } catch (err) {
     return NextResponse.json({ error: err.message, results: [] }, { status: 500 });
+  }
+}
+
+export async function POST(request) {
+  const auth = await requireUser();
+  if (auth.error) return auth.error;
+
+  try {
+    const { queries, lat, lng } = await request.json();
+
+    if (!Array.isArray(queries)) {
+      return NextResponse.json({ error: 'queries must be an array' }, { status: 400 });
+    }
+    if (queries.length > MAX_BATCH) {
+      return NextResponse.json(
+        { error: `Too many queries (max ${MAX_BATCH})` },
+        { status: 400 }
+      );
+    }
+
+    const near =
+      Number.isFinite(Number(lat)) && Number.isFinite(Number(lng))
+        ? { lat: Number(lat), lng: Number(lng) }
+        : null;
+
+    const cache = await getGeocodeCacheClients();
+    const { hits, stats } = await resolvePlaces(queries, { near, cache });
+
+    // Keyed by the caller's own strings, so it does not have to know how
+    // queries are normalised. Unresolved places come back as null rather than
+    // being absent, which is a different thing from "not asked for".
+    const results = {};
+    for (const query of queries) {
+      const hit = hits.get(normaliseQuery(query));
+      results[query] = hit ? { lat: hit.lat, lng: hit.lng, name: hit.name } : null;
+    }
+
+    return NextResponse.json({ results, stats });
+  } catch (err) {
+    return NextResponse.json({ error: err.message, results: {} }, { status: 500 });
   }
 }

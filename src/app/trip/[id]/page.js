@@ -1,6 +1,6 @@
 'use client';
 
-import { useState, useEffect, useCallback, useRef, use } from 'react';
+import { useState, useEffect, useCallback, useMemo, useRef, use } from 'react';
 import { notFound, useRouter } from 'next/navigation';
 import { useAuth } from '@/context/AuthProvider';
 import { useToast } from '@/components/ui/Toast';
@@ -24,6 +24,9 @@ import BookingsPanel from '@/components/trip/BookingsPanel';
 import { bookingsTotal } from '@/lib/bookings';
 import { clearsExistingActivities, orderOffsetFor, planGeneration } from '@/lib/generationGuard';
 import { replanDay } from '@/lib/replanDay';
+import { geocodeBatch, unresolvedLocations } from '@/lib/geocodeClient';
+import { checkItinerary } from '@/lib/conflictChecker';
+import { conflictsForActivity, dayConflictSummary, worstSeverity } from '@/lib/conflictView';
 import { normalizeCategory } from '@/lib/itineraryPrompt';
 
 const CATEGORY_CONFIG = {
@@ -65,7 +68,9 @@ export default function TripEditorPage({ params }) {
   const [locating, setLocating] = useState(null);
   const [showNearby, setShowNearby] = useState(false);
   const [showBookings, setShowBookings] = useState(false);
-  const [replanningDay, setReplanningDay] = useState(false);
+  // The day_number currently being rebuilt, or null. A number rather than a
+  // boolean so the panel can show the spinner on the day it belongs to.
+  const [replanningDay, setReplanningDay] = useState(null);
   const [togglingLock, setTogglingLock] = useState(false);
   const [stays, setStays] = useState([]);
   const [transport, setTransport] = useState([]);
@@ -251,22 +256,36 @@ export default function TripEditorPage({ params }) {
     );
   };
 
-  const handleReplanSelectedDay = async () => {
-    if (blockedByLock() || !selectedDay) return;
-    setReplanningDay(true);
+  /**
+   * Rebuild one day around everything on it.
+   *
+   * Takes the day rather than reading selectedDay, so the conflict panel can fix
+   * a day the user is not currently looking at — being made to go and find the
+   * broken day before you may fix it is exactly the friction the panel exists to
+   * remove.
+   */
+  const handleReplanDay = async (day = selectedDay) => {
+    if (blockedByLock() || !day) return;
+    setReplanningDay(day.day_number);
     const result = await replanDay(supabase, {
       trip,
-      day: selectedDay,
-      keep: activities[selectedDay.id] || [],
+      day,
+      keep: activities[day.id] || [],
     });
-    setReplanningDay(false);
+    setReplanningDay(null);
 
     if (!result.ok) return toast.error(result.error, 'Replan failed');
     toast.success(
-      `Day ${selectedDay.day_number} rebuilt — ${result.count} entries, times and travel sorted.`,
+      `Day ${day.day_number} rebuilt — ${result.count} entries, times and travel sorted.`,
       result.theme || 'Day Replanned'
     );
     fetchTripData();
+  };
+
+  /** Fix the day with this number, wherever the request came from. */
+  const handleFixDay = (dayNumber) => {
+    const day = days.find((d) => d.day_number === dayNumber);
+    if (day) handleReplanDay(day);
   };
 
   const handleLocateActivities = async () => {
@@ -293,10 +312,14 @@ export default function TripEditorPage({ params }) {
       }
     }
 
+    // Resolve every outstanding place in one batched, cache-backed request, then
+    // write. This was one billed Places lookup per activity, awaited in series.
+    const coords = await geocodeBatch(unresolvedLocations(pending), center);
+
     let located = 0;
     for (let i = 0; i < pending.length; i++) {
       const act = pending[i];
-      const hit = await geocodeLocation(act.location_name, center);
+      const hit = coords.get(act.location_name);
       if (hit) {
         await supabase.from('activities')
           .update({ latitude: hit.lat, longitude: hit.lng })
@@ -443,23 +466,30 @@ export default function TripEditorPage({ params }) {
   };
 
   // AI Generate itinerary
-  /** Write one generated day's activities, returning how many landed. */
-  const insertDayPlan = async (day, dayPlan, currency, orderOffset = 0) => {
+  /**
+   * Write one generated day's activities.
+   *
+   * @returns {{written: number, failures: string[]}} — failures are surfaced
+   *   rather than counted silently. Every value here has already been validated
+   *   against the database's own constraints server-side, so a rejected row now
+   *   means something went wrong that the traveler needs to hear about, not a
+   *   model that wrote "9am" into a TIME column.
+   */
+  const insertDayPlan = async (day, dayPlan, currency, orderOffset = 0, coords = new Map()) => {
     const acts = dayPlan?.activities || [];
     let written = 0;
+    const failures = [];
 
     for (let i = 0; i < acts.length; i++) {
       const act = acts[i];
-      let lat = null, lng = null;
-      if (act.location_name) {
-        // location_name usually already carries the town; appending the
-        // destination again produced queries no geocoder could match.
-        const geo = await geocodeLocation(
-          act.location_name,
-          trip.dest_lat != null ? { lat: trip.dest_lat, lng: trip.dest_lng } : null
-        );
-        if (geo) { lat = geo.lat; lng = geo.lng; }
-      }
+      // The server geocoded these already, to check travel times before anything
+      // was written. Reusing its coordinates keeps the saved trip identical to
+      // the one that was checked, and saves a billed lookup per activity.
+      // `coords` covers whatever the server could not resolve, filled in by one
+      // batch call rather than a lookup per activity inside this loop.
+      const fallback = act.location_name ? coords.get(act.location_name) : null;
+      const lat = Number.isFinite(act.latitude) ? act.latitude : fallback?.lat ?? null;
+      const lng = Number.isFinite(act.longitude) ? act.longitude : fallback?.lng ?? null;
 
       const { error } = await supabase.from('activities').insert({
         trip_day_id: day.id,
@@ -478,11 +508,33 @@ export default function TripEditorPage({ params }) {
         longitude: lng,
       });
 
-      if (!error) written++;
+      if (error) failures.push(`${act.title}: ${error.message}`);
+      else written++;
       setAiProgress((p) => (p ? { ...p, done: p.done + 1 } : p));
     }
 
-    return written;
+    return { written, failures };
+  };
+
+  /**
+   * Record what the server's conflict check found.
+   *
+   * The check runs before the insert and most conflicts are fixed by
+   * re-prompting, but the survivors have to be visible somewhere — otherwise the
+   * traveler owns a plan that was known to be unachievable and nothing says so.
+   * Never fatal: the itinerary is already saved, and the check can be re-run.
+   */
+  const persistConflicts = async (conflicts) => {
+    if (!conflicts) return;
+
+    const { error } = await supabase
+      .from('trips')
+      .update({ conflicts, conflicts_checked_at: new Date().toISOString() })
+      .eq('id', trip.id);
+
+    if (error) {
+      console.warn('[WanderForge] Could not store the conflict check:', error.message);
+    }
   };
 
   /** Adopt the AI's local currency and backfill destination coords for weather. */
@@ -533,6 +585,12 @@ export default function TripEditorPage({ params }) {
           transportMode: trip.transport_mode,
           budgetLevel: trip.ai_preferences?.budget_level || 'moderate',
           notes: trip.ai_preferences?.notes || '',
+          // The server geocodes and conflict-checks the plan before returning
+          // it; these let it bias place lookups to the right town and judge
+          // whether a day runs over budget.
+          destLat: trip.dest_lat,
+          destLng: trip.dest_lng,
+          totalBudget: trip.total_budget,
         }),
       });
 
@@ -559,21 +617,55 @@ export default function TripEditorPage({ params }) {
 
       setAiProgress({ phase: 'saving', done: 0, total });
 
+      // One batch call for everything the server could not place, before the
+      // write loop rather than inside it. This used to be a Places lookup per
+      // activity — around $1.30 for a 5-day trip, re-spent on every regenerate.
+      const coords = await geocodeBatch(
+        unresolvedLocations(data.itinerary.flatMap((d) => d.activities || [])),
+        trip.dest_lat != null ? { lat: trip.dest_lat, lng: trip.dest_lng } : null
+      );
+
       let written = 0;
+      const failures = [];
       for (const dayPlan of data.itinerary) {
         const day = days.find((d) => d.day_number === dayPlan.day);
         if (!day) continue;
         // Appending must not reuse order_index values already on the day.
         const offset = orderOffsetFor(mode, activities[day.id]?.length || 0);
-        written += await insertDayPlan(day, dayPlan, data.currency, offset);
+        const result = await insertDayPlan(day, dayPlan, data.currency, offset, coords);
+        written += result.written;
+        failures.push(...result.failures);
       }
 
       await applyTripMetadata(data);
+      await persistConflicts(data.conflicts);
 
       toast.success(
         `${data.itinerary.length} days planned, ${written} activities saved.`,
         mode === 'append' ? 'Added to your itinerary 🤖' : 'AI Itinerary Ready 🤖'
       );
+
+      // Say so rather than quietly reporting a smaller number than the user
+      // watched the progress bar count to.
+      if (failures.length) {
+        console.warn('[WanderForge] Activities rejected on insert:', failures);
+        toast.error(
+          `${failures.length} activity(s) could not be saved: ${failures[0]}`,
+          'Partly saved'
+        );
+      }
+
+      // The plan is real and editable either way, but an unachievable one must
+      // not arrive looking like a clean result.
+      const conflicts = data.conflicts;
+      if (conflicts && !conflicts.achievable) {
+        const blocking = conflicts.summary?.errors ?? 0;
+        toast.error(
+          `The check found ${blocking || conflicts.issues.length} transition(s) that will not work — open Check Itinerary to see which.`,
+          'Saved, but not fully achievable'
+        );
+      }
+
       fetchTripData();
     } catch (err) {
       toast.error(err.message, 'AI Generation Failed');
@@ -630,6 +722,9 @@ export default function TripEditorPage({ params }) {
           transportMode: trip.transport_mode,
           budgetLevel: trip.ai_preferences?.budget_level || 'moderate',
           notes: trip.ai_preferences?.notes || '',
+          destLat: trip.dest_lat,
+          destLng: trip.dest_lng,
+          totalBudget: trip.total_budget,
         }),
       });
 
@@ -641,13 +736,36 @@ export default function TripEditorPage({ params }) {
 
       setAiProgress({ phase: 'saving', done: 0, total: dayPlan.activities.length });
       const offset = activities[selectedDay.id]?.length || 0;
-      const written = await insertDayPlan(selectedDay, dayPlan, data.currency, offset);
+      const coords = await geocodeBatch(
+        unresolvedLocations(dayPlan.activities),
+        trip.dest_lat != null ? { lat: trip.dest_lat, lng: trip.dest_lng } : null
+      );
+      const { written, failures } = await insertDayPlan(
+        selectedDay, dayPlan, data.currency, offset, coords
+      );
       await applyTripMetadata(data);
+      // Deliberately not persisted: this checked one day, and writing it to
+      // trips.conflicts would claim the whole trip had been re-checked.
 
       toast.success(
         `Day ${selectedDay.day_number} filled with ${written} activities.`,
         dayPlan.theme || 'Day Planned 🤖'
       );
+
+      if (failures.length) {
+        console.warn('[WanderForge] Activities rejected on insert:', failures);
+        toast.error(
+          `${failures.length} activity(s) could not be saved: ${failures[0]}`,
+          'Partly saved'
+        );
+      }
+
+      if (data.conflicts && !data.conflicts.achievable) {
+        toast.error(
+          'Some transitions on this day will not work — open Check Itinerary to see which.',
+          'Filled, but not fully achievable'
+        );
+      }
       fetchTripData();
     } catch (err) {
       toast.error(err.message, 'AI Fill Failed');
@@ -657,6 +775,26 @@ export default function TripEditorPage({ params }) {
       setAiProgress(null);
     }
   };
+
+  /**
+   * The live conflict check.
+   *
+   * Recomputed from whatever is currently on screen, on every edit. It is a pure
+   * function over already-loaded data — no AI, no network, no cost — so there is
+   * no reason to make the user press a button and wait for it, and no reason for
+   * the result to ever be stale. The generate route runs the same checker
+   * server-side before writing; this is the same answer, kept current.
+   *
+   * Travel times come from the checker's road model rather than a routing call.
+   * Fetching real road legs would be more accurate and would cost a billed
+   * Google Routes request per pair of activities, every time a day is opened.
+   */
+  const conflictReport = useMemo(() => {
+    if (!trip || days.length === 0) {
+      return { issues: [], summary: { errors: 0, warnings: 0, info: 0, checkedDays: 0, checkedActivities: 0 } };
+    }
+    return checkItinerary(trip, days, activities);
+  }, [trip, days, activities]);
 
   // Thrown during render so the not-found boundary catches it. Calling
   // notFound() from the fetch callback would not be caught at all.
@@ -687,6 +825,9 @@ export default function TripEditorPage({ params }) {
   const isOwner = trip.user_id === user?.id;
   const selectedDayWeather = weather && selectedDay?.date
     ? weather.find(w => w.date === selectedDay.date) : null;
+  const selectedDayConflicts = selectedDay
+    ? dayConflictSummary(conflictReport.issues, selectedDay.day_number)
+    : null;
 
   return (
     <>
@@ -832,14 +973,26 @@ export default function TripEditorPage({ params }) {
                     const dayActs = activities[day.id] || [];
                     const isSelected = selectedDay?.id === day.id;
                     const dayWeather = weather?.find(w => w.date === day.date);
+                    // A broken day has to be findable without opening it.
+                    const dayIssues = dayConflictSummary(conflictReport.issues, day.day_number);
                     return (
                       <button key={day.id}
-                        className={`day-tab ${isSelected ? 'day-tab--selected' : ''}`}
+                        className={`day-tab ${isSelected ? 'day-tab--selected' : ''} ${dayIssues.impossible ? 'day-tab--broken' : ''}`}
                         onClick={() => { setSelectedDay(day); setSelectedActivityId(null); }}
                       >
                         <div className="day-tab__top">
                           <span className="day-tab__number">Day {day.day_number}</span>
-                          {dayWeather && <span className="day-tab__weather" title={dayWeather.description}>{dayWeather.icon}</span>}
+                          <span className="day-tab__marks">
+                            {dayIssues.impossible && (
+                              <span className="day-tab__flag day-tab__flag--bad"
+                                title={`${dayIssues.hard.length} thing(s) on this day will not work`}>⛔</span>
+                            )}
+                            {!dayIssues.impossible && dayIssues.worst === 'warning' && (
+                              <span className="day-tab__flag day-tab__flag--warn"
+                                title={`${dayIssues.soft.length} thing(s) worth checking`}>⚠️</span>
+                            )}
+                            {dayWeather && <span className="day-tab__weather" title={dayWeather.description}>{dayWeather.icon}</span>}
+                          </span>
                         </div>
                         <span className="day-tab__date">
                           {day.date && new Date(day.date + 'T00:00:00').toLocaleDateString('en-US', { weekday: 'short', month: 'short', day: 'numeric' })}
@@ -874,9 +1027,9 @@ export default function TripEditorPage({ params }) {
                           <Button
                             variant="ghost"
                             size="sm"
-                            onClick={handleReplanSelectedDay}
-                            loading={replanningDay}
-                            disabled={replanningDay || isLocked}
+                            onClick={() => handleReplanDay(selectedDay)}
+                            loading={replanningDay === selectedDay.day_number}
+                            disabled={replanningDay != null || isLocked}
                             icon={<span>🔄</span>}
                             title="Rebuild this day around everything on it: order, timings and travel"
                           >
@@ -890,6 +1043,40 @@ export default function TripEditorPage({ params }) {
                         </Button>
                       </div>
                     </div>
+
+                    {/* The whole point of S2-3: an impossible day says so where the
+                        day is, with the fix next to the problem — not behind a
+                        modal the user has to think to open. */}
+                    {selectedDayConflicts?.impossible && (
+                      <div className="day-alert">
+                        <span className="day-alert__icon">⛔</span>
+                        <div className="day-alert__body">
+                          <strong className="day-alert__title">
+                            This day cannot be done as written
+                          </strong>
+                          <ul className="day-alert__list">
+                            {selectedDayConflicts.hard.map((issue, i) => (
+                              <li key={i}>{issue.message}</li>
+                            ))}
+                          </ul>
+                        </div>
+                        <div className="day-alert__actions">
+                          <Button
+                            size="sm"
+                            variant="primary"
+                            onClick={() => handleReplanDay(selectedDay)}
+                            loading={replanningDay === selectedDay.day_number}
+                            disabled={replanningDay != null || isLocked}
+                            title="Rebuild this day around everything on it: order, timings and travel"
+                          >
+                            🔄 Fix this day
+                          </Button>
+                          <button className="day-alert__more" onClick={() => setShowConflicts(true)}>
+                            See all checks
+                          </button>
+                        </div>
+                      </div>
+                    )}
 
                     {selectedDayActivities.length === 0 ? (
                       <div className="main__empty">
@@ -914,6 +1101,8 @@ export default function TripEditorPage({ params }) {
                         {selectedDayActivities.map((activity, idx) => {
                           const cat = CATEGORY_CONFIG[activity.category] || CATEGORY_CONFIG.other;
                           const isHighlighted = selectedActivityId === activity.id;
+                          const actIssues = conflictsForActivity(conflictReport.issues, activity.id);
+                          const actWorst = worstSeverity(actIssues);
                           return (
                             <div key={activity.id}
                               className={`timeline__item ${isHighlighted ? 'timeline__item--highlighted' : ''}`}
@@ -923,7 +1112,7 @@ export default function TripEditorPage({ params }) {
                                 <div className="timeline__dot" style={{ background: cat.color }} />
                                 {idx < selectedDayActivities.length - 1 && <div className="timeline__connector" />}
                               </div>
-                              <div className="activity-card">
+                              <div className={`activity-card ${actWorst ? `activity-card--${actWorst}` : ''}`}>
                                 <div className="activity-card__header">
                                   <span className="activity-card__category" style={{ background: `${cat.color}18`, color: cat.color }}>
                                     {cat.icon} {cat.label}
@@ -944,6 +1133,11 @@ export default function TripEditorPage({ params }) {
                                 </div>
                                 {activity.description && <p className="activity-card__desc">{activity.description}</p>}
                                 {activity.notes && <p className="activity-card__notes">📝 {activity.notes}</p>}
+                                {actIssues.map((issue, i) => (
+                                  <p key={i} className={`activity-card__issue activity-card__issue--${issue.severity}`}>
+                                    {issue.severity === 'error' ? '⛔' : issue.severity === 'warning' ? '⚠️' : 'ℹ️'} {issue.message}
+                                  </p>
+                                ))}
                               </div>
                             </div>
                           );
@@ -1049,12 +1243,13 @@ export default function TripEditorPage({ params }) {
       />
 
       <ConflictCheckPanel
-        trip={{ ...trip, currency: tripCurrency }}
-        days={days}
-        activities={activities}
         isOpen={showConflicts}
         onClose={() => setShowConflicts(false)}
-        onReplanned={fetchTripData}
+        report={conflictReport}
+        trip={trip}
+        onFixDay={handleFixDay}
+        fixingDay={replanningDay}
+        locked={isLocked}
       />
 
       {/* AI Chat Panel */}
@@ -1167,6 +1362,9 @@ export default function TripEditorPage({ params }) {
         .lock-banner__title { display: block; font-size: var(--text-sm); }
         .lock-banner__text { font-size: var(--text-xs); color: var(--color-text-secondary); }
         .day-tab__weather { font-size: 16px; }
+        .day-tab__marks { display: inline-flex; align-items: center; gap: 4px; }
+        .day-tab__flag { font-size: 13px; line-height: 1; }
+        .day-tab--broken { box-shadow: inset 3px 0 0 var(--color-error); }
         .day-tab__date { font-size: var(--text-xs); color: var(--color-text-tertiary); }
         .day-tab__count { font-size: var(--text-xs); color: var(--color-text-tertiary); }
 
@@ -1231,6 +1429,42 @@ export default function TripEditorPage({ params }) {
         .activity-card__mapped { color: var(--color-success); font-weight: 500; }
         .activity-card__desc { font-size: var(--text-sm); color: var(--color-text-secondary); line-height: 1.4; }
         .activity-card__notes { font-size: var(--text-xs); color: var(--color-text-tertiary); margin-top: var(--space-1); font-style: italic; }
+        /* A hard conflict outlines the card; a soft one only annotates it. The
+           difference has to be visible before the text is read. */
+        .activity-card--error { border-color: var(--color-error); background: var(--color-error-bg); }
+        .activity-card--warning { border-color: var(--color-warning); }
+        .activity-card__issue {
+          font-size: var(--text-xs); line-height: 1.4;
+          margin-top: var(--space-1); padding-left: var(--space-1);
+          border-left: 2px solid transparent;
+        }
+        .activity-card__issue--error { color: var(--color-error); border-left-color: var(--color-error); font-weight: 500; }
+        .activity-card__issue--warning { color: var(--color-warning); border-left-color: var(--color-warning); }
+        .activity-card__issue--info { color: var(--color-text-tertiary); }
+
+        .day-alert {
+          display: flex; gap: var(--space-3); align-items: flex-start;
+          padding: var(--space-3) var(--space-4);
+          margin-bottom: var(--space-4);
+          border: 1px solid var(--color-error);
+          border-left-width: 4px;
+          border-radius: var(--radius-md);
+          background: var(--color-error-bg);
+          flex-wrap: wrap;
+        }
+        .day-alert__icon { font-size: 20px; line-height: 1.2; }
+        .day-alert__body { flex: 1 1 260px; min-width: 0; }
+        .day-alert__title { font-size: var(--text-sm); color: var(--color-error); }
+        .day-alert__list {
+          margin: var(--space-1) 0 0; padding-left: var(--space-4);
+          font-size: var(--text-xs); color: var(--color-text-secondary); line-height: 1.5;
+        }
+        .day-alert__actions { display: flex; align-items: center; gap: var(--space-2); }
+        .day-alert__more {
+          background: none; border: none; cursor: pointer;
+          font-size: var(--text-xs); color: var(--color-text-secondary);
+          text-decoration: underline;
+        }
 
         .modal-form { display: flex; flex-direction: column; gap: var(--space-3); }
         .modal-form__label { font-size: var(--text-sm); font-weight: 500; color: var(--color-text); display: block; margin-bottom: 4px; }
