@@ -88,6 +88,9 @@ export default function ConflictCheckPanel({
   onFixDay,
   fixingDay = null,
   locked = false,
+  onMeasureRoads,
+  measuringRoads = false,
+  measuredLegs = 0,
 }) {
   const issues = report?.issues || [];
   const summary = report?.summary || {};
@@ -143,10 +146,41 @@ export default function ConflictCheckPanel({
           ))
         )}
 
+        {/* The difference between an estimate and a measurement is the single
+            biggest factor in whether these findings are trustworthy, so it is
+            stated rather than left for the reader to assume. */}
+        <div className="cc__roads">
+          {measuredLegs > 0 ? (
+            <p className="cc__note">
+              <strong>{measuredLegs} journey{measuredLegs === 1 ? '' : 's'} measured</strong>{' '}
+              against real road distances and driving times. Anything not on that
+              list is estimated from straight-line distance, which is optimistic
+              on winding mountain roads.
+            </p>
+          ) : (
+            <p className="cc__note">
+              Travel times here are <strong>estimated</strong> from straight-line
+              distance — roughly right in towns, and measured 1.6x optimistic on
+              the hill road this was tested against.
+            </p>
+          )}
+          {onMeasureRoads && (
+            <Button
+              size="sm"
+              variant="secondary"
+              onClick={onMeasureRoads}
+              loading={measuringRoads}
+              disabled={measuringRoads}
+              title="Look up the real road distance and driving time for every journey on this trip"
+            >
+              🛣️ Measure the real roads
+            </Button>
+          )}
+        </div>
+
         <p className="cc__foot">
-          Travel times are estimated from road distance, not a live routing call,
-          and opening hours are judged by category rather than looked up — so a
-          warning is worth confirming, not obeying. Anything marked{' '}
+          Opening hours are judged by category rather than looked up, so those
+          warnings are worth confirming rather than obeying. Anything marked{' '}
           <strong>impossible</strong> is arithmetic: the journey does not fit the
           gap left for it.
         </p>
@@ -179,6 +213,13 @@ export default function ConflictCheckPanel({
           font-size: var(--text-xs); color: var(--color-text-secondary);
         }
         .cc__note { font-size: var(--text-xs); color: var(--color-text-tertiary); }
+        .cc__roads {
+          display: flex; align-items: center; justify-content: space-between;
+          gap: var(--space-3); flex-wrap: wrap;
+          padding: var(--space-3); border-radius: var(--radius-md);
+          background: var(--color-bg-secondary);
+        }
+        .cc__roads p { flex: 1 1 260px; margin: 0; line-height: 1.5; }
         .cc__day { display: flex; flex-direction: column; gap: var(--space-2); }
         .cc__day-head {
           display: flex; align-items: center; justify-content: space-between;

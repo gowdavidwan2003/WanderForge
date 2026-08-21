@@ -4,6 +4,7 @@ import {
   TRAVEL_TOLERANCE_MIN,
   checkItinerary,
   haversineKm,
+  roadLegKey,
   travelMinutes,
 } from '@/lib/conflictChecker';
 
@@ -265,5 +266,79 @@ describe('travelMinutes', () => {
     // Worth pinning: no caller currently passes road data, so this is the path
     // every check in the app actually takes.
     expect(travelMinutes(10.1, 'car')).toBeLessThan(40);
+  });
+});
+
+
+describe('measured roads vs estimates', () => {
+  /**
+   * The whole reason routeLookup exists. Chikmagaluru town to Mullayanagiri is
+   * 10.1 km straight line. Measured against Google Routes it is 21.6 km and 44
+   * minutes of driving; the flat model calls the whole journey 35 minutes. Until
+   * road data reached the checker, 35 was the number every warning was built on.
+   */
+  const townToPeak = [
+    act({ id: 'a', title: 'Breakfast in town', start_time: '08:00', end_time: '09:00', ...TOWN }),
+    act({ id: 'b', title: 'Mullayanagiri Peak', start_time: '09:30', end_time: '12:00', ...PEAK }),
+  ];
+
+  it('stays quiet on a 30-minute gap when it is only estimating', () => {
+    // The flat model wants 35 minutes and 30 are available. Five short, inside
+    // the tolerance, so nothing is said — and the real journey needs 56.
+    expect(types(check(townToPeak))).not.toContain('travel-time');
+  });
+
+  it('catches the same day once the road is measured', () => {
+    const legs = {
+      // Real figures from Google Routes for this pair.
+      [roadLegKey(TOWN, PEAK)]: { km: 21.6, minutes: 44 },
+    };
+    const result = checkItinerary(
+      { transport_mode: 'car' },
+      [{ id: 'd1', day_number: 1 }],
+      { d1: townToPeak },
+      legs
+    );
+
+    // 56 minutes needed against 30 available: 26 short, and now visible.
+    const issue = result.issues.find((i) => i.type === 'travel-time');
+    expect(issue).toBeDefined();
+    // And it says so in the language of measurement rather than estimation.
+    expect(issue.message).toContain('routing puts at');
+    expect(issue.message).toContain('21.6 km by road');
+  });
+
+  it('uses the provider duration in preference to any speed model', () => {
+    // A routing engine already knows about gradient, road class and traffic.
+    // All the checker adds is the door-to-door overhead it never includes.
+    expect(travelMinutes(10.1, 'car', 21.6, 44)).toBe(56);
+  });
+
+  it('falls back to the sinuosity model when only distance is known', () => {
+    // ORS returns distance without a usable duration for some profiles.
+    // Better than the flat model and still not the real answer: 71 against a
+    // measured 56. A second-best, not a substitute for asking the provider.
+    expect(travelMinutes(10.1, 'car')).toBe(35);
+    expect(travelMinutes(10.1, 'car', 21.6)).toBe(71);
+  });
+
+  it('keys legs by coordinates, so they survive activities being re-inserted', () => {
+    // Generation checks a plan with synthetic ids; the editor checks the same
+    // places after they have real ones. An id-keyed leg would be lost between
+    // the two, which is why nothing could ever populate the old key format.
+    const before = { id: 'gen-day-1-act-0', ...TOWN };
+    const after = { id: 'e5b1c9a2-real-uuid', ...TOWN };
+    expect(roadLegKey(before, PEAK)).toBe(roadLegKey(after, PEAK));
+  });
+
+  it('rounds coordinates so a re-geocoded venue still hits the same leg', () => {
+    // Geocoding returns very slightly different coordinates for one place over
+    // time. Rounding to ~110 m keeps those on one cached leg.
+    const nudged = { latitude: TOWN.latitude + 0.0002, longitude: TOWN.longitude - 0.0003 };
+    expect(roadLegKey(nudged, PEAK)).toBe(roadLegKey(TOWN, PEAK));
+  });
+
+  it('is null for a leg with an unmapped end', () => {
+    expect(roadLegKey(TOWN, { latitude: null, longitude: null })).toBeNull();
   });
 });

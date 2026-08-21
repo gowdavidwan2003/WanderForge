@@ -5,9 +5,14 @@
 --
 -- conflictChecker has always had a correction for winding roads: when it knows
 -- the real road distance, a ratio of more than twice the straight-line distance
--- means switchbacks, and no flat-road average speed applies. Chikmagaluru town
--- to Mullayanagiri is 10.1 km straight, 21.8 km by road, and takes about 90
--- minutes; the flat model puts it at 35.
+-- means switchbacks, and no flat-road average speed applies. Measured on that
+-- route — Chikmagaluru town to Mullayanagiri, 10.1 km straight line:
+--
+--   flat estimate, no road data    35 min   <- what every check used to do
+--   sinuosity model, road km only  71 min
+--   Google Routes, measured        56 min   <- 21.6 km, 44 min driving
+--
+-- So the shipped model was 1.6x optimistic on the terrain the product is for.
 --
 -- That correction has never run. It needs `roadKm`, and no caller ever supplied
 -- it — so every check in the app used great-circle distance times 1.3 at a fixed

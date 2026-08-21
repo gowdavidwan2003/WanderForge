@@ -19,7 +19,9 @@ import {
   checkGeneratedItinerary,
   conflictPayload,
   conflictRetryPrompt,
+  toCheckerInput,
 } from '@/lib/conflictReport';
+import { legsForItinerary, resolveLegs } from '@/lib/routeLookup';
 import {
   MIN_COMPLETION_MS,
   MIN_GEOCODE_MS,
@@ -186,8 +188,29 @@ async function finishPlan(raw, {
     geo = await geocodeItinerary(plan.itinerary, { near, deadlineAt: budget.deadlineAt(), cache });
   }
 
+  // Real road distances, so the winding-road correction in travelMinutes can
+  // actually run. Without them every estimate is great-circle distance times 1.3
+  // at a flat speed — measured 1.6x optimistic on the Chikmagaluru hill road
+  // this product was built around. Cache-first, so a
+  // destination somebody has already planned costs nothing, and a regeneration
+  // of the same trip costs nothing.
+  onStatus('Measuring the roads between your stops…');
+
+  let roadLegs = {};
+  let roadStats = null;
+  if (budget.canAfford(MIN_GEOCODE_MS)) {
+    const shaped = toCheckerInput(geo.itinerary);
+    const resolved = await resolveLegs(legsForItinerary(shaped.days, shaped.activities), {
+      mode: transportMode,
+      cache,
+      deadlineAt: budget.deadlineAt(),
+    });
+    roadLegs = resolved.legs;
+    roadStats = resolved.stats;
+  }
+
   onStatus('Working out how long each journey really takes…');
-  let check = checkGeneratedItinerary(geo.itinerary, tripShape);
+  let check = checkGeneratedItinerary(geo.itinerary, tripShape, roadLegs);
 
   const conflictPrompt = conflictRetryPrompt(check.issues, geo.itinerary);
   if (conflictPrompt && budget.canAfford(MIN_COMPLETION_MS)) {
@@ -206,7 +229,10 @@ async function finishPlan(raw, {
             })
           : { itinerary: revalidated.data.itinerary, located: 0, total: 0, hits: geo.hits };
 
-        const reCheck = checkGeneratedItinerary(reGeo.itinerary, tripShape);
+        // Same legs where the places are unchanged; anything new falls back to
+        // the estimate rather than spending a second round of Routes calls
+        // inside the budget that is left.
+        const reCheck = checkGeneratedItinerary(reGeo.itinerary, tripShape, roadLegs);
         // Keep whichever plan is actually more achievable. A model asked to fix
         // a schedule will sometimes return one that is worse.
         if (blockingIssues(reCheck.issues).length < blockingIssues(check.issues).length) {
@@ -226,7 +252,12 @@ async function finishPlan(raw, {
       conflicts: conflictPayload(check, {
         attempts: completions,
         geocoded: { located: geo.located, total: geo.total, ...(geo.stats || {}) },
+        roads: roadStats,
       }),
+      // Handed to the client so the editor's live check measures the same
+      // journeys this one did without paying for them twice. Keyed by
+      // coordinates, so they survive the activities being inserted with real ids.
+      roadLegs,
     },
   };
 }

@@ -16,9 +16,18 @@ import {
  *
  * Why this exists at all: conflictChecker has always had a correction for
  * winding roads, and it has never run, because it needs the real road distance
- * and nothing supplied one. Chikmagaluru town to Mullayanagiri is 10.1 km
- * straight and 21.8 km by road; the flat model calls that 35 minutes and the
- * drive takes about 90. With the road distance the same function returns 71.
+ * and nothing supplied one.
+ *
+ * Measured against the route this product was built around — Chikmagaluru town to
+ * Mullayanagiri, straight-line 10.1 km:
+ *
+ *   flat estimate, no road data   35 min   <- what every check used to do
+ *   sinuosity model, road km only 71 min
+ *   Google Routes, measured       56 min   <- 21.6 km, 44 min driving + overhead
+ *
+ * So the flat model was 1.6x optimistic, and the sinuosity fallback overshoots
+ * by 1.27x. Using the provider's own duration when there is one is clearly best,
+ * and is what resolveLegs supplies.
  *
  * Server-side only: these calls carry the operator's Google key.
  */

@@ -51,7 +51,7 @@ const PROCESSORS = [
   },
   {
     name: 'Google Maps Platform',
-    role: 'Turning place names into map coordinates, and measuring driving times',
+    role: 'Turning place names into map coordinates, and measuring road distances and driving times between your stops',
     sent:
       'Place names from your itinerary and the coordinates of your destination, used to bias the search to the right town. Nothing identifies you.',
     where: 'United States.',
@@ -164,10 +164,11 @@ export default function PrivacyPage() {
       </div>
 
       <p>
-        Place names resolved from itineraries are cached for up to 30 days and
-        shared across all users, so the same place is not looked up twice. That
-        cache holds a place name and its coordinates. It records nothing about who
-        searched for it.
+        Place names and the road legs between them are cached for up to 30 days
+        and shared across all users, so the same place and the same journey are
+        not looked up twice. Those caches hold a place name with its coordinates,
+        and a pair of coordinates with the distance and driving time between them.
+        Neither records anything about who searched for it.
       </p>
 
       <h2>Who can see your trips</h2>

@@ -96,12 +96,35 @@ arithmetic produces more confident output, not more correct output.
    shown in the editor. An unachievable plan is never silently saved as a normal
    one.
 
+### Estimates versus measurements
+
+The difference is worth stating, because it decides how much the output is worth.
+Measured against the route this was built around — Chikmagaluru town to
+Mullayanagiri, 10.1 km straight line:
+
+| Method | Result |
+|---|---|
+| Great-circle × 1.3 at a flat speed | 35 min |
+| Sinuosity model, road distance only | 71 min |
+| **Google Routes, measured** | **56 min** (21.6 km, 44 min driving) |
+
+The flat model is 1.6× optimistic on that road and the sinuosity fallback
+overshoots by 1.27×, so asking the provider is clearly best and is what happens
+now. The Itinerary Check panel says how many journeys on a trip were measured
+rather than estimated, and offers to measure the rest.
+
+A transport entry is exempt from these checks. It *is* the journey — the prompt
+asks the model to give every hop over 45 minutes its own entry, and measuring the
+gap before that entry and demanding it cover the drive flagged correct plans as
+broken.
+
 ### What it cannot do
 
-Real opening hours, closures, weather on the day, road conditions, or whether a
-place still exists. Warnings about opening hours are inferred from the activity's
-category and are worth confirming, not obeying. Anything marked **impossible** is
-arithmetic — the journey does not fit the gap.
+Real opening hours, closures, weather on the day, or whether a place still
+exists. Warnings about opening hours are inferred from the activity's category
+and are worth confirming, not obeying. Findings under 10 minutes are suppressed
+as noise. Anything marked **impossible** is arithmetic — the journey does not fit
+the gap.
 
 ---
 
@@ -162,6 +185,8 @@ editor. They are not optional and several are not backward compatible:
 | `010` | Atomic replan and atomic trip creation. **The app cannot create or replan without this.** |
 | `011` | Trip editing and delete-cascade verification. **Trip Settings cannot save without this.** |
 | `012` | RLS performance and index realignment |
+| `013` | Encrypted API-key storage. **Deletes any plaintext keys** — those users must re-enter and rotate |
+| `014` | Shared road-leg cache. Without it every check re-bills Google Routes |
 
 `010` also deletes trips that have no days — the orphans left by the old
 two-step creation. Read the block before running it if you have data you care
@@ -190,7 +215,10 @@ thin wrappers around it.
 | [`conflictView.js`](src/lib/conflictView.js) | Hard versus soft, grouped for the editor |
 | [`streamingJson.js`](src/lib/streamingJson.js) | Pulls whole days out of JSON that is still arriving |
 | [`placeLookup.js`](src/lib/placeLookup.js) | Batched, cached, deadline-bounded geocoding |
-| [`geocodeCache.js`](src/lib/geocodeCache.js) | The 30-day shared cache and its key derivation |
+| [`geocodeCache.js`](src/lib/geocodeCache.js) | The 30-day shared place cache and its key derivation |
+| [`routeLookup.js`](src/lib/routeLookup.js) | Real road distances and driving times, batched and cached |
+| [`routeCache.js`](src/lib/routeCache.js) | The 30-day shared road-leg cache, keyed by rounded coordinates |
+| [`serverCrypto.js`](src/lib/serverCrypto.js) | AES-256-GCM for secrets at rest |
 | [`groq.js`](src/lib/groq.js) | Key rotation. Rotates on rate limits only — a 400 fails fast |
 | [`groqModels.js`](src/lib/groqModels.js) | Which model each workload uses, and how the token budget is sized |
 | [`aiBudget.js`](src/lib/aiBudget.js) | Divides the route's 60s ceiling across completions, geocoding and checking |
@@ -237,6 +265,9 @@ base.
 
 - The RLS performance work in `012` is unbenchmarked. `supabase/verify/012_rls_benchmark.sql`
   seeds volume and measures it; nobody has run it yet.
+- Road measurement is best-effort. A leg with no route, no routing key or a
+  provider timeout falls back to the straight-line estimate for that pair, and
+  the panel says how many were measured so the difference is visible.
 - Email invitations are stored but not sent — `resend` is a dependency with no
   caller.
 - `chart.js`, `@dnd-kit` and `idb` are installed and unused. Budget charts,

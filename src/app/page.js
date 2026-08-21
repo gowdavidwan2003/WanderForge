@@ -27,7 +27,7 @@ import { TEMPLATE_COUNT } from '@/lib/templates';
 export const metadata = {
   title: 'WanderForge — Trip plans that check their own work',
   description:
-    'An AI travel planner that works out how long every journey really takes before it saves your itinerary. Plan together in real time, split the bills, export to PDF or your calendar.',
+    'An AI travel planner that measures every journey against real road distances and driving times before it saves your itinerary. Plan together in real time, split the bills, export to PDF or your calendar.',
 };
 
 const FEATURES = [
@@ -35,7 +35,7 @@ const FEATURES = [
     icon: '🔍',
     title: 'It checks its own work',
     // src/lib/conflictChecker.js, wired into generation and the editor.
-    desc: 'Before a plan is saved, every journey is costed out — road distance, your transport mode, and the time lost to parking and queues. A day that cannot be walked says so, on the day, next to the problem, with a one-click fix.',
+    desc: 'Before a plan is saved, every journey is measured against real road distances and driving times — and a 22 km road of hairpins is not 22 km of motorway. A day that cannot be walked says so, on the day, next to the problem, with a one-click fix.',
     accent: 'var(--color-primary)',
   },
   {
@@ -133,9 +133,9 @@ export default function LandingPage() {
             <p className="lp-hero__sub">
               A model will happily put you on a mountain at 09:10 and in a
               restaurant across the valley at 09:30. WanderForge works out how
-              long every journey really takes — road distance, your transport mode, parking
-              and walk-in time — before your itinerary is saved, and tells you
-              which ones will not work.
+              long every journey really takes — real road distances, real driving
+              times, and the parking and walk-in nobody counts — before your
+              itinerary is saved, and tells you which ones will not work.
             </p>
 
             <div className="lp-hero__actions">
@@ -165,8 +165,8 @@ export default function LandingPage() {
               </div>
               <p className="lp-proof__verdict">
                 <span aria-hidden="true">⛔</span> Only 15m between them, but the
-                journey is about 13 km (estimated) — roughly 34m by car. Short by
-                19m.
+                road is 21.6 km, which routing puts at 44m of driving — 56m door
+                to door once you have parked and walked in. Short by 41m.
               </p>
             </div>
           </div>

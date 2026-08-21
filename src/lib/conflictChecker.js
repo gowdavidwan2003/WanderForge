@@ -90,8 +90,10 @@ export function haversineKm(lat1, lng1, lat2, lng2) {
  * straight-line distance tells us about the terrain: a road more than twice the
  * crow-flight distance is switchbacking up a hill, and no flat-road average speed
  * applies. Chikmagaluru town → Mullayanagiri is 10.1 km straight but 21.8 km by
- * road (ratio 2.16) and really takes ~90 minutes, which a flat 35 km/h model puts
- * at 34 minutes.
+ * road (ratio 2.16). Measured against Google Routes: 21.6 km and 44 minutes of
+ * driving, 56 door to door — against 35 from the flat model and 71 from the
+ * sinuosity fallback below. The ~90 minutes this comment used to claim was never
+ * measured; the fallback is a decent second-best, not a substitute for asking.
  *
  * @param straightKm great-circle distance
  * @param mode       transport mode
