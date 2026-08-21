@@ -73,6 +73,16 @@ export default function TripEditorPage({ params }) {
   // visual change otherwise: the list silently rearranges and a screen-reader
   // user has no way to know whether the button did anything.
   const [announcement, setAnnouncement] = useState('');
+  /**
+   * Measured road legs, keyed by coordinates.
+   *
+   * Without these the live check estimates every journey as great-circle
+   * distance times 1.3 at a flat speed — optimistic by two to three times on
+   * mountain roads. Generation hands its own measurements over in the response,
+   * so the common path costs nothing; the Check panel can ask for the rest.
+   */
+  const [roadLegs, setRoadLegs] = useState({});
+  const [measuringRoads, setMeasuringRoads] = useState(false);
   // Lets the Cancel button reach the in-flight request. Aborting closes the SSE
   // connection, which the route treats as "stop paying Groq".
   const generateAbortRef = useRef(null);
@@ -919,6 +929,10 @@ export default function TripEditorPage({ params }) {
 
       await applyTripMetadata(data);
       await persistConflicts(data.conflicts);
+      // Already measured server-side during the check; reusing them means the
+      // editor's live check agrees with the one that decided whether to
+      // re-prompt, for no extra Routes calls.
+      if (data.roadLegs) setRoadLegs((prev) => ({ ...prev, ...data.roadLegs }));
 
       toast.success(
         `${data.itinerary.length} days planned, ${written} activities saved.`,
@@ -1091,8 +1105,47 @@ export default function TripEditorPage({ params }) {
     if (!trip || days.length === 0) {
       return { issues: [], summary: { errors: 0, warnings: 0, info: 0, checkedDays: 0, checkedActivities: 0 } };
     }
-    return checkItinerary(trip, days, activities);
-  }, [trip, days, activities]);
+    return checkItinerary(trip, days, activities, roadLegs);
+  }, [trip, days, activities, roadLegs]);
+
+  /**
+   * Measure the journeys this trip has not measured yet.
+   *
+   * Deliberately on demand rather than on load. Google Routes is billed per leg,
+   * and firing it every time a trip is opened is the bill the geocode cache was
+   * built to stop. Cached legs are free, so the second press on any trip costs
+   * nothing at all.
+   */
+  const handleMeasureRoads = async () => {
+    const coordsFor = (dayId) =>
+      (activities[dayId] || []).filter((a) => Number.isFinite(a.latitude) && Number.isFinite(a.longitude));
+
+    setMeasuringRoads(true);
+    try {
+      const merged = { ...roadLegs };
+      for (const day of days) {
+        const acts = coordsFor(day.id);
+        if (acts.length < 2) continue;
+
+        const res = await fetch('/api/route-matrix', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            coordinates: acts.slice(0, 25).map((a) => [a.longitude, a.latitude]),
+            mode: trip.transport_mode || 'car',
+          }),
+        });
+        const body = await res.json();
+        Object.assign(merged, body.roadLegs || {});
+      }
+      setRoadLegs(merged);
+      toast.success('Travel times now use real road distances.', 'Roads measured');
+    } catch (err) {
+      toast.error(err.message || 'Could not measure the roads', 'Measurement failed');
+    } finally {
+      setMeasuringRoads(false);
+    }
+  };
 
   // Thrown during render so the not-found boundary catches it. Calling
   // notFound() from the fetch callback would not be caught at all.
@@ -1668,6 +1721,9 @@ export default function TripEditorPage({ params }) {
         onClose={() => setShowConflicts(false)}
         report={conflictReport}
         trip={trip}
+        onMeasureRoads={handleMeasureRoads}
+        measuringRoads={measuringRoads}
+        measuredLegs={Object.keys(roadLegs).length}
         onFixDay={handleFixDay}
         fixingDay={replanningDay}
         locked={isLocked}

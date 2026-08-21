@@ -24,8 +24,9 @@ export default function Footer() {
                 </div>
                 <p className="footer__tagline text-accent">Forge your perfect journey</p>
                 <p className="footer__desc">
-                  AI trip planning that checks its own work: every itinerary is
-                  measured against real road distances before it is saved.
+                  AI trip planning that checks its own work: every journey is
+                  measured against real road distances before the itinerary is
+                  saved.
                 </p>
               </div>
 

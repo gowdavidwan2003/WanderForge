@@ -53,10 +53,13 @@ export function toCheckerInput(itinerary = []) {
  * @param itinerary validated `data.itinerary`, with coordinates where known
  * @param trip      { transport_mode, total_budget, currency } for the checks
  *                  that need them
+ * @param roadLegs  measured road legs, keyed by roadLegKey. Without them the
+ *                  travel estimates are straight-line and optimistic on winding
+ *                  roads, which is what they were until routeLookup existed.
  */
-export function checkGeneratedItinerary(itinerary = [], trip = {}) {
+export function checkGeneratedItinerary(itinerary = [], trip = {}, roadLegs = {}) {
   const { days, activities } = toCheckerInput(itinerary);
-  return checkItinerary(trip, days, activities);
+  return checkItinerary(trip, days, activities, roadLegs);
 }
 
 /** The issues worth spending a second completion on. */
@@ -123,7 +126,7 @@ export function conflictRetryPrompt(issues = [], itinerary = []) {
     '',
     digest,
     '',
-    'It was checked against real road distances and driving times, and these transitions do not work:',
+    'It was checked against estimated road distances and driving times, and these transitions do not work:',
     '',
     ...lines,
     '',
@@ -143,7 +146,7 @@ export function conflictRetryPrompt(issues = [], itinerary = []) {
  * against the saved rows, so this is a record of what was known at generation
  * time rather than a cache to be trusted forever.
  */
-export function conflictPayload(result, { attempts = 1, geocoded = null } = {}) {
+export function conflictPayload(result, { attempts = 1, geocoded = null, roads = null } = {}) {
   return {
     issues: result.issues,
     summary: result.summary,
@@ -152,6 +155,10 @@ export function conflictPayload(result, { attempts = 1, geocoded = null } = {}) 
     // never had any.
     attempts,
     geocoded,
+    // How many journeys were measured rather than estimated. An itinerary
+    // checked entirely against straight-line distance is a weaker statement
+    // than one checked against roads, and the difference should be visible.
+    roads,
     achievable: blockingIssues(result.issues).length === 0,
   };
 }
