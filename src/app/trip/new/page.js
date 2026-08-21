@@ -127,52 +127,50 @@ export default function NewTripPage() {
       const title = formData.title || `Trip to ${formData.destination}`;
       const dayCount = getDayCount();
 
-      // Create the trip
-      const { data: trip, error: tripError } = await withTimeout(supabase
-        .from('trips')
-        .insert({
-          user_id: user.id,
-          title,
-          destination: formData.destination,
-          start_date: formData.startDate,
-          end_date: formData.endDate,
-          transport_mode: formData.transportMode,
-          total_budget: formData.totalBudget ? parseFloat(formData.totalBudget) : null,
-          // 'AUTO' resolves from the destination; the AI confirms it on generate.
-          currency: formData.currency === 'AUTO'
-            ? (inferCurrency(formData.destination) || 'USD')
-            : formData.currency,
-          status: 'planned',
-          ai_preferences: {
-            interests: formData.interests,
-            budget_level: formData.budgetLevel,
-            travel_style: formData.travelStyle,
-            notes: formData.notes,
-          },
-        })
-        .select()
-        .single(), 'Creating your trip');
-
-      if (tripError) throw tripError;
-      console.log('[WanderForge] Trip created:', trip.id);
-
-      // Create trip days
-      const days = Array.from({ length: dayCount }, (_, i) => {
+      const tripDays = Array.from({ length: dayCount }, (_, i) => {
         const date = new Date(formData.startDate);
         date.setDate(date.getDate() + i);
         return {
-          trip_id: trip.id,
           day_number: i + 1,
           date: date.toISOString().split('T')[0],
         };
       });
 
-      const { error: daysError } = await withTimeout(
-        supabase.from('trip_days').insert(days),
-        'Creating trip days'
+      // One RPC, one transaction. This used to be two inserts: the trip, then its
+      // days. A failure on the second left a trip the editor cannot open — no
+      // days means no timeline, no day to select, and no way to add anything —
+      // and the user was returned to a dashboard listing a trip that was already
+      // broken. PostgREST gives each request its own transaction, so no amount of
+      // sequencing from the browser could make those two one.
+      const { data: trip, error: tripError } = await withTimeout(
+        supabase.rpc('create_trip_with_days', {
+          p_trip: {
+            title,
+            destination: formData.destination,
+            start_date: formData.startDate,
+            end_date: formData.endDate,
+            transport_mode: formData.transportMode,
+            total_budget: formData.totalBudget || null,
+            // 'AUTO' resolves from the destination; the AI confirms it on generate.
+            currency: formData.currency === 'AUTO'
+              ? (inferCurrency(formData.destination) || 'USD')
+              : formData.currency,
+            status: 'planned',
+            ai_preferences: {
+              interests: formData.interests,
+              budget_level: formData.budgetLevel,
+              travel_style: formData.travelStyle,
+              notes: formData.notes,
+            },
+          },
+          p_days: tripDays,
+        }),
+        'Creating your trip'
       );
-      if (daysError) throw daysError;
-      console.log('[WanderForge] Created', dayCount, 'days');
+
+      if (tripError) throw tripError;
+      if (!trip?.id) throw new Error('The trip was not created. Please try again.');
+      console.log('[WanderForge] Trip created with', dayCount, 'days:', trip.id);
 
       toast.success('Your trip has been created!', 'Trip Created 🎉');
       router.push(`/trip/${trip.id}`);

@@ -23,11 +23,19 @@ import NearbyPlacesPanel from '@/components/trip/NearbyPlacesPanel';
 import BookingsPanel from '@/components/trip/BookingsPanel';
 import { bookingsTotal } from '@/lib/bookings';
 import { clearsExistingActivities, orderOffsetFor, planGeneration } from '@/lib/generationGuard';
-import { replanDay } from '@/lib/replanDay';
+import { replanDay, undoReplan } from '@/lib/replanDay';
 import { geocodeBatch, unresolvedLocations } from '@/lib/geocodeClient';
 import { checkItinerary } from '@/lib/conflictChecker';
 import { conflictsForActivity, dayConflictSummary, worstSeverity } from '@/lib/conflictView';
 import { normalizeCategory } from '@/lib/itineraryPrompt';
+import {
+  applyActivityEvent,
+  applyDayEvent,
+  createEchoFilter,
+  pickSelectedDay,
+  shapeTripPayload,
+} from '@/lib/realtimeState';
+import { fetchWeather as loadWeather } from '@/lib/weatherCache';
 
 const CATEGORY_CONFIG = {
   sightseeing: { icon: '🏛️', color: '#6366F1', label: 'Sightseeing' },
@@ -71,6 +79,10 @@ export default function TripEditorPage({ params }) {
   // The day_number currently being rebuilt, or null. A number rather than a
   // boolean so the panel can show the spinner on the day it belongs to.
   const [replanningDay, setReplanningDay] = useState(null);
+  // The snapshot of whichever day was replanned last, so it can be put back.
+  // Cleared once used, or when the day is changed by anything else.
+  const [lastReplan, setLastReplan] = useState(null);
+  const [undoing, setUndoing] = useState(false);
   const [togglingLock, setTogglingLock] = useState(false);
   const [stays, setStays] = useState([]);
   const [transport, setTransport] = useState([]);
@@ -80,11 +92,63 @@ export default function TripEditorPage({ params }) {
     latitude: '', longitude: '',
   });
 
-  // Real-time collaboration
-  const handleRealtimeUpdate = useCallback((table, event) => {
-    // Auto-refresh when collaborators make changes
-    fetchTripData();
+  /**
+   * Rows this tab just wrote, so their echoes can be skipped.
+   *
+   * Realtime delivers postgres_changes for the client's own writes. The merge
+   * below is idempotent so an echo is harmless, but it still repaints the
+   * timeline — 25 times during one AI Generate.
+   */
+  const echoes = useRef(createEchoFilter());
+
+  /**
+   * A mirror of the state a realtime event needs to read.
+   *
+   * The event handler is created once, so it cannot close over current state,
+   * and the two pieces it has to change together cannot both be reached through
+   * functional updaters. Kept in sync after every render.
+   */
+  const stateRef = useRef({ days: [], activities: {} });
+
+  /**
+   * Apply one realtime event to local state.
+   *
+   * This used to call fetchTripData() — three serial queries and a weather
+   * fetch — for every event, including every echo of this tab's own inserts.
+   * One AI Generate was roughly 125 requests. The payload already carries the
+   * whole row, so merging it costs nothing and gives the same answer.
+   */
+  const handleRealtimeUpdate = useCallback((table, event, row) => {
+    if (!row) return;
+    if (echoes.current.isEcho(row.id)) return;
+
+    if (table === 'activities') {
+      setActivities((prev) => applyActivityEvent(prev, event, row));
+      return;
+    }
+
+    if (table === 'trip_days') {
+      // A day event moves two pieces of state at once, and they have to agree —
+      // a new day needs its activity bucket, a deleted one must take its bucket
+      // with it. Read both from the mirror rather than nesting one setState
+      // updater inside another: updaters must be pure, and StrictMode runs them
+      // twice to prove it.
+      const { days: prevDays, activities: prevActs } = stateRef.current;
+      const merged = applyDayEvent(prevDays, prevActs, event, row);
+      setDays(merged.days);
+      setActivities(merged.activities);
+      setSelectedDay((current) => pickSelectedDay(merged.days, current));
+      return;
+    }
+
+    if (table === 'trips') {
+      setTrip((prev) => ({ ...prev, ...row }));
+    }
   }, []);
+
+  useEffect(() => {
+    stateRef.current = { days, activities };
+  });
 
   const { onlineUsers } = useRealtimeTrip(id, handleRealtimeUpdate, days.map(d => d.id));
 
@@ -92,6 +156,27 @@ export default function TripEditorPage({ params }) {
   const toast = useToast();
   const router = useRouter();
   const supabase = getSupabaseBrowserClient();
+
+  /**
+   * Weather follows the destination, not the itinerary.
+   *
+   * It used to be fetched from inside fetchTripData, so every realtime event
+   * re-fetched a forecast for coordinates that had not moved. The forecast
+   * depends on where the trip is and when — neither changes when somebody edits
+   * an activity — so this keys on the coordinates alone and reads a cached
+   * forecast when there is a fresh one.
+   */
+  useEffect(() => {
+    const lat = trip?.dest_lat;
+    const lng = trip?.dest_lng;
+    if (lat == null || lng == null) return;
+
+    let cancelled = false;
+    loadWeather(lat, lng).then((forecast) => {
+      if (!cancelled && forecast) setWeather(forecast);
+    });
+    return () => { cancelled = true; };
+  }, [trip?.dest_lat, trip?.dest_lng]);
 
   useEffect(() => {
     // Same trap as the dashboard: bailing out while auth is unresolved without
@@ -116,10 +201,13 @@ export default function TripEditorPage({ params }) {
     // trip_collaborators.user_id references auth.users, not profiles, so PostgREST
     // cannot embed profiles here — the old `select('*, profiles(...)')` returned
     // PGRST200 on every call and left the list permanently empty. Join manually.
-    const { data: rows, error } = await supabase
-      .from('trip_collaborators')
-      .select('*')
-      .eq('trip_id', id);
+    // withTimeout like every other load path: supabase-js queues queries behind
+    // an in-flight token refresh, and a refresh that never completes leaves the
+    // promise unsettled rather than rejected.
+    const { data: rows, error } = await withTimeout(
+      supabase.from('trip_collaborators').select('*').eq('trip_id', id),
+      'Loading collaborators'
+    );
 
     if (error) {
       console.error('[WanderForge] Failed to load collaborators:', error);
@@ -134,10 +222,10 @@ export default function TripEditorPage({ params }) {
     // No email: migration 007 revokes SELECT on that column from client roles,
     // because a world-readable email list is what let an attacker pick a victim
     // to impersonate. display_name is always populated by handle_new_user.
-    const { data: people } = await supabase
-      .from('profiles')
-      .select('id, display_name')
-      .in('id', rows.map(r => r.user_id));
+    const { data: people } = await withTimeout(
+      supabase.from('profiles').select('id, display_name').in('id', rows.map(r => r.user_id)),
+      'Loading collaborator names'
+    );
 
     const byId = Object.fromEntries((people || []).map(p => [p.id, p]));
     setCollaborators(rows.map(c => ({
@@ -148,17 +236,29 @@ export default function TripEditorPage({ params }) {
 
   const fetchBookings = async () => {
     const [a, t] = await Promise.all([
-      supabase.from('accommodations').select('*').eq('trip_id', id),
-      supabase.from('transport_bookings').select('*').eq('trip_id', id),
+      withTimeout(supabase.from('accommodations').select('*').eq('trip_id', id), 'Loading stays'),
+      withTimeout(supabase.from('transport_bookings').select('*').eq('trip_id', id), 'Loading transport'),
     ]);
     setStays(a.data || []);
     setTransport(t.data || []);
   };
 
+  /**
+   * Load the whole trip in one round trip.
+   *
+   * This was a waterfall: trip, then days, then activities, each awaiting the
+   * one before, plus a weather call — and it ran again on every realtime event.
+   * PostgREST can embed all three, and does the joining server-side.
+   */
   const fetchTripData = async () => {
     try {
-      const { data: tripData, error: tripErr } = await withTimeout(
-        supabase.from('trips').select('*').eq('id', id).single(),
+      const { data: row, error: tripErr } = await withTimeout(
+        supabase
+          .from('trips')
+          .select('*, trip_days(*, activities(*))')
+          .eq('id', id)
+          .order('day_number', { referencedTable: 'trip_days', ascending: true })
+          .single(),
         'Loading this trip'
       );
 
@@ -166,51 +266,26 @@ export default function TripEditorPage({ params }) {
       // rather than a failure: .single() reports no rows as PGRST116. Record it
       // and let the render throw notFound(), because notFound() called from this
       // async callback would escape the error boundary entirely.
-      if (tripErr?.code === 'PGRST116' || (!tripErr && !tripData)) {
+      if (tripErr?.code === 'PGRST116' || (!tripErr && !row)) {
         setMissing(true);
         return;
       }
 
       if (tripErr) throw tripErr;
-      setTrip(tripData);
 
-      const { data: daysData } = await supabase
-        .from('trip_days').select('*').eq('trip_id', id).order('day_number');
-      setDays(daysData || []);
-
-      if (daysData?.length > 0) {
-        if (!selectedDay) setSelectedDay(daysData[0]);
-
-        const dayIds = daysData.map(d => d.id);
-        const { data: actData } = await supabase
-          .from('activities').select('*').in('trip_day_id', dayIds).order('order_index');
-
-        const grouped = {};
-        daysData.forEach(d => { grouped[d.id] = []; });
-        (actData || []).forEach(a => {
-          if (grouped[a.trip_day_id]) grouped[a.trip_day_id].push(a);
-        });
-        setActivities(grouped);
-
-        // Fetch weather if we have destination coords
-        if (tripData.dest_lat && tripData.dest_lng) {
-          fetchWeather(tripData.dest_lat, tripData.dest_lng);
-        }
-      }
+      const shaped = shapeTripPayload(row);
+      setTrip(shaped.trip);
+      setDays(shaped.days);
+      setActivities(shaped.activities);
+      // Keeps the day the user is looking at, rather than snapping back to day 1
+      // every time anything reloads.
+      setSelectedDay((current) => pickSelectedDay(shaped.days, current));
     } catch {
       toast.error('Failed to load trip');
       router.push('/dashboard');
     } finally {
       setLoading(false);
     }
-  };
-
-  const fetchWeather = async (lat, lng) => {
-    try {
-      const res = await fetch(`/api/weather?lat=${lat}&lng=${lng}`);
-      const data = await res.json();
-      if (data.forecast) setWeather(data.forecast);
-    } catch { /* ignore */ }
   };
 
   // Geocode a place name, biased toward the trip's destination.
@@ -267,6 +342,7 @@ export default function TripEditorPage({ params }) {
   const handleReplanDay = async (day = selectedDay) => {
     if (blockedByLock() || !day) return;
     setReplanningDay(day.day_number);
+
     const result = await replanDay(supabase, {
       trip,
       day,
@@ -274,12 +350,44 @@ export default function TripEditorPage({ params }) {
     });
     setReplanningDay(null);
 
-    if (!result.ok) return toast.error(result.error, 'Replan failed');
+    // A failure now genuinely means nothing changed — the delete and the inserts
+    // are one transaction — so this can say so instead of leaving the user
+    // wondering what survived.
+    if (!result.ok) return toast.error(result.error, 'Replan failed — the day is unchanged');
+
+    applyDayWrite(day.id, result.activities);
+    setLastReplan({ dayId: day.id, dayNumber: day.day_number, undo: result.undo });
+
     toast.success(
-      `Day ${day.day_number} rebuilt — ${result.count} entries, times and travel sorted.`,
+      `Day ${day.day_number} rebuilt — ${result.count} entries, times and travel sorted. Use "Undo replan" if you preferred the old one.`,
       result.theme || 'Day Replanned'
     );
-    fetchTripData();
+  };
+
+  /** Put back the day as it was before the last replan. */
+  const handleUndoReplan = async () => {
+    if (blockedByLock() || !lastReplan) return;
+    setUndoing(true);
+    const result = await undoReplan(supabase, lastReplan.dayId, lastReplan.undo);
+    setUndoing(false);
+
+    if (!result.ok) return toast.error(result.error, 'Could not undo');
+
+    applyDayWrite(lastReplan.dayId, result.activities);
+    toast.success(`Day ${lastReplan.dayNumber} is back as it was.`, 'Replan undone');
+    setLastReplan(null);
+  };
+
+  /**
+   * Put the rows the server just returned straight into local state.
+   *
+   * The RPC returns what it wrote, so there is nothing to go back and read. The
+   * ids are registered as ours first, so the realtime echoes of this same write
+   * are ignored rather than repainting the timeline once per row.
+   */
+  const applyDayWrite = (dayId, rows = []) => {
+    echoes.current.remember(rows.map((r) => r.id));
+    setActivities((prev) => ({ ...prev, [dayId]: rows }));
   };
 
   /** Fix the day with this number, wherever the request came from. */
@@ -477,21 +585,16 @@ export default function TripEditorPage({ params }) {
    */
   const insertDayPlan = async (day, dayPlan, currency, orderOffset = 0, coords = new Map()) => {
     const acts = dayPlan?.activities || [];
-    let written = 0;
-    const failures = [];
+    if (acts.length === 0) return { written: 0, failures: [] };
 
-    for (let i = 0; i < acts.length; i++) {
-      const act = acts[i];
+    const rows = acts.map((act, i) => {
       // The server geocoded these already, to check travel times before anything
       // was written. Reusing its coordinates keeps the saved trip identical to
       // the one that was checked, and saves a billed lookup per activity.
       // `coords` covers whatever the server could not resolve, filled in by one
-      // batch call rather than a lookup per activity inside this loop.
+      // batch call rather than a lookup per activity inside a loop.
       const fallback = act.location_name ? coords.get(act.location_name) : null;
-      const lat = Number.isFinite(act.latitude) ? act.latitude : fallback?.lat ?? null;
-      const lng = Number.isFinite(act.longitude) ? act.longitude : fallback?.lng ?? null;
-
-      const { error } = await supabase.from('activities').insert({
+      return {
         trip_day_id: day.id,
         title: act.title,
         description: act.description || '',
@@ -504,16 +607,31 @@ export default function TripEditorPage({ params }) {
         booking_link: act.booking_link || '',
         order_index: orderOffset + i,
         currency: currency || trip.currency || 'USD',
-        latitude: lat,
-        longitude: lng,
-      });
+        latitude: Number.isFinite(act.latitude) ? act.latitude : fallback?.lat ?? null,
+        longitude: Number.isFinite(act.longitude) ? act.longitude : fallback?.lng ?? null,
+      };
+    });
 
-      if (error) failures.push(`${act.title}: ${error.message}`);
-      else written++;
-      setAiProgress((p) => (p ? { ...p, done: p.done + 1 } : p));
+    // One request per day, not per activity. A 25-activity generation was 25
+    // round trips here — and every one of them came back as a realtime event
+    // that triggered a full reload. It also makes a day all-or-nothing, which is
+    // now safe to rely on: every value was validated server-side against the
+    // same constraints Postgres enforces.
+    const { data: inserted, error } = await supabase.from('activities').insert(rows).select();
+
+    if (error) {
+      return { written: 0, failures: [`Day ${day.day_number}: ${error.message}`] };
     }
 
-    return { written, failures };
+    // Straight into local state, and registered as ours so the echoes of this
+    // write are ignored rather than repainting the timeline once per row.
+    applyDayWrite(
+      day.id,
+      orderOffset > 0 ? [...(activities[day.id] || []), ...(inserted || [])] : inserted || []
+    );
+    setAiProgress((p) => (p ? { ...p, done: p.done + rows.length } : p));
+
+    return { written: inserted?.length ?? 0, failures: [] };
   };
 
   /**
@@ -550,7 +668,8 @@ export default function TripEditorPage({ params }) {
         await supabase.from('trips').update({
           dest_lat: destGeo.lat, dest_lng: destGeo.lng,
         }).eq('id', trip.id);
-        fetchWeather(destGeo.lat, destGeo.lng);
+        // No explicit weather call: setting dest_lat/dest_lng on the trip row is
+        // what the weather effect keys on, so it follows on the next load.
       }
     }
   };
@@ -612,6 +731,9 @@ export default function TripEditorPage({ params }) {
           // Abort rather than insert: a failed clear followed by a successful
           // insert reproduces exactly the duplication this guard exists to stop.
           if (error) throw new Error(`Could not clear the old itinerary: ${error.message}`);
+          // Local state has to follow, because nothing re-reads the trip after
+          // this any more — the inserts below return their own rows.
+          setActivities(Object.fromEntries(dayIds.map((dayId) => [dayId, []])));
         }
       }
 
@@ -666,7 +788,9 @@ export default function TripEditorPage({ params }) {
         );
       }
 
-      fetchTripData();
+      // No reconciling read. Every row written came back from the insert and is
+      // already on screen; re-reading 25 rows the browser just wrote is the
+      // pattern this whole ticket is about.
     } catch (err) {
       toast.error(err.message, 'AI Generation Failed');
     } finally {
@@ -766,7 +890,6 @@ export default function TripEditorPage({ params }) {
           'Filled, but not fully achievable'
         );
       }
-      fetchTripData();
     } catch (err) {
       toast.error(err.message, 'AI Fill Failed');
     } finally {
@@ -1022,6 +1145,19 @@ export default function TripEditorPage({ params }) {
                             <span>{selectedDayWeather.tempMax}°/{selectedDayWeather.tempMin}°</span>
                             <span className="weather-badge__desc">{selectedDayWeather.description}</span>
                           </div>
+                        )}
+                        {lastReplan?.dayId === selectedDay.id && (
+                          <Button
+                            variant="ghost"
+                            size="sm"
+                            onClick={handleUndoReplan}
+                            loading={undoing}
+                            disabled={undoing || isLocked}
+                            icon={<span>↩</span>}
+                            title="Put this day back exactly as it was before the replan"
+                          >
+                            Undo replan
+                          </Button>
                         )}
                         {selectedDayActivities.length > 0 && (
                           <Button
