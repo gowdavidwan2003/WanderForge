@@ -3,6 +3,7 @@ import { groqChatCompletion } from '@/lib/groq';
 import { REALISM_RULES, preferencesBlock } from '@/lib/itineraryPrompt';
 import { requireUser } from '@/lib/api/requireUser';
 import { clampRequestedDays } from '@/lib/tripLimits';
+import { PLANNING_MODEL, PLANNING_REASONING_EFFORT, planningMaxTokens } from '@/lib/groqModels';
 import { validateItinerary, validationRetryPrompt } from '@/lib/itinerarySchema';
 import { geocodeItinerary } from '@/lib/placeLookup';
 import { getGeocodeCacheClients } from '@/lib/api/geocodeCacheClients';
@@ -22,8 +23,6 @@ import {
 // ceiling makes the timeout ours to control rather than the platform's, and
 // aiBudget divides it between the completions, the geocoding and the check.
 export const maxDuration = 60;
-
-const MODEL = 'llama-3.3-70b-versatile';
 
 /**
  * The response shape, stated once.
@@ -76,17 +75,24 @@ Field rules, enforced on receipt:
  * failure (give up, retrying costs quota and fails the same way), a malformed
  * response (retryable, and the model can be told what went wrong), and success.
  */
-async function requestItinerary(messages, { budget, userApiKey }) {
+async function requestItinerary(messages, { budget, userApiKey, days }) {
+  // Sized from THESE messages, not from the first prompt. Groq counts prompt plus
+  // reserved completion against one per-minute allowance, and a retry's prompt
+  // carries the conflicts and the plan digest on top of the original — reusing
+  // the first request's ceiling would reserve more than the allowance and fail
+  // the retry outright with a 413 rather than a 429.
+  const promptText = messages.map((m) => m.content).join('\n');
+
   const result = await groqChatCompletion(
     {
-      model: MODEL,
+      model: PLANNING_MODEL,
       messages,
       // Lower temperature keeps distance and duration estimates grounded rather
-      // than creative. No max_tokens: it capped long itineraries, and Groq
-      // reserves the full value against the per-minute token limit up front,
-      // which was causing spurious rate-limit errors on back-to-back requests.
+      // than creative.
       temperature: 0.4,
       response_format: { type: 'json_object' },
+      reasoning_effort: PLANNING_REASONING_EFFORT,
+      max_completion_tokens: planningMaxTokens(days, promptText),
     },
     { userApiKey, budgetMs: budget.completionSlice() }
   );
@@ -177,7 +183,6 @@ ${FORMAT_BLOCK}`;
     // category was rejected row by row, halfway through writing the trip.
     let plan = null;
     let errors = null;
-    let lastContent = null;
     let completions = 0;
 
     for (let attempt = 0; attempt < 2; attempt++) {
@@ -186,22 +191,21 @@ ${FORMAT_BLOCK}`;
         // better than being killed mid-flight with no response body at all.
         if (!budget.canAfford(MIN_COMPLETION_MS)) break;
 
-        // The model needs its own previous answer in context for the error paths
-        // ("itinerary[0].activities[2].start_time") to mean anything. It costs a
-        // second copy of the itinerary in tokens; a partially written trip costs
-        // more.
-        if (lastContent) messages.push({ role: 'assistant', content: lastContent });
+        // Deliberately WITHOUT the model's own previous answer. Echoing it back
+        // would make the error paths ("itinerary[0].activities[2].start_time")
+        // resolvable, but it costs a second full copy of the itinerary against an
+        // 8,000 token-per-minute ceiling shared with the reply — so the retry
+        // would truncate. The errors quote both the path and the offending value,
+        // which is what the model actually needs to fix.
         messages.push({ role: 'user', content: validationRetryPrompt(errors) });
       }
 
-      const res = await requestItinerary(messages, { budget, userApiKey });
+      const res = await requestItinerary(messages, { budget, userApiKey, days });
       completions++;
 
       // A provider error is not something a retry fixes — it fails identically
       // while burning the budget.
       if (res.failure) return res.failure;
-
-      lastContent = res.content ?? null;
 
       if (res.errors) {
         errors = res.errors;
@@ -259,12 +263,14 @@ ${FORMAT_BLOCK}`;
     let check = checkGeneratedItinerary(geo.itinerary, tripShape);
 
     // ---- 3. One re-prompt naming the conflicts ---------------------------
-    const conflictPrompt = conflictRetryPrompt(check.issues);
+    // Carries a compact digest of the plan rather than the model's verbatim
+    // answer — same reason as above, and a rescheduling decision only needs the
+    // day, order, times and places.
+    const conflictPrompt = conflictRetryPrompt(check.issues, geo.itinerary);
     if (conflictPrompt && budget.canAfford(MIN_COMPLETION_MS)) {
-      if (lastContent) messages.push({ role: 'assistant', content: lastContent });
       messages.push({ role: 'user', content: conflictPrompt });
 
-      const res = await requestItinerary(messages, { budget, userApiKey });
+      const res = await requestItinerary(messages, { budget, userApiKey, days });
       completions++;
 
       if (!res.failure && !res.errors) {

@@ -2,6 +2,7 @@ import { NextResponse } from 'next/server';
 import { groqChatCompletion } from '@/lib/groq';
 import { REALISM_RULES, preferencesBlock } from '@/lib/itineraryPrompt';
 import { requireUser } from '@/lib/api/requireUser';
+import { PLANNING_MODEL, PLANNING_REASONING_EFFORT, planningMaxTokens } from '@/lib/groqModels';
 
 /**
  * Re-plan a single day.
@@ -87,13 +88,15 @@ RESPOND IN THIS EXACT JSON FORMAT (no other text, just JSON):
 }`;
 
     const result = await groqChatCompletion({
-        model: 'llama-3.3-70b-versatile',
+        model: PLANNING_MODEL,
         messages: [
           { role: 'system', content: REALISM_RULES },
           { role: 'user', content: userPrompt },
         ],
         temperature: 0.4,
         response_format: { type: 'json_object' },
+        reasoning_effort: PLANNING_REASONING_EFFORT,
+        max_completion_tokens: planningMaxTokens(1, REALISM_RULES + userPrompt),
     }, { userApiKey });
 
     if (!result.ok) {

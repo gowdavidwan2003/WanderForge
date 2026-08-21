@@ -27,68 +27,99 @@ export const ACTIVITY_CATEGORIES = [
   'nightlife', 'culture', 'nature', 'relaxation', 'other',
 ];
 
-export const REALISM_RULES = `You are WanderForge AI, an expert travel planner. You create itineraries that a real traveler can actually follow, in this priority order:
-1. ACHIEVABLE - every single item is physically possible in the time given
-2. EXPERIENCE - within what is achievable, the most rewarding, authentic activities
-3. MONEY - best value for the budget level
+/**
+ * Force a model-supplied category into the set the database accepts.
+ *
+ * activities.category carries a CHECK constraint listing exactly these values, so
+ * anything outside it — "food/drink", "sightseeing/culture", a capitalised
+ * "Food" — is rejected by Postgres and that activity is silently dropped from the
+ * itinerary. The prompt asks for one of the eleven, but a model improvises, and
+ * the replacement planning model does so more often than the retired one did: a
+ * five-day generation produced an out-of-enum value on the first try.
+ *
+ * Unknown values become 'other' rather than being discarded — the activity itself
+ * is still worth keeping.
+ */
+/**
+ * Words the model actually reaches for instead of the eleven allowed values.
+ *
+ * Every entry here was observed in real generations: "meal", "viewpoint",
+ * "leisure", "trekking" and "market" all appeared. Mapping them keeps the
+ * activity's meaning — a meal filed as "other" stops being a meal, so the day no
+ * longer looks like it has lunch in it.
+ */
+const CATEGORY_SYNONYMS = {
+  meal: 'food', meals: 'food', dining: 'food', restaurant: 'food', cafe: 'food',
+  breakfast: 'food', lunch: 'food', dinner: 'food', drinks: 'food', coffee: 'food',
+  viewpoint: 'sightseeing', landmark: 'sightseeing', monument: 'sightseeing',
+  sight: 'sightseeing', tour: 'sightseeing', attraction: 'sightseeing',
+  temple: 'culture', museum: 'culture', heritage: 'culture', historical: 'culture',
+  history: 'culture', church: 'culture', religious: 'culture', art: 'culture',
+  trekking: 'adventure', trek: 'adventure', hiking: 'adventure', hike: 'adventure',
+  safari: 'adventure', trail: 'adventure', sport: 'adventure',
+  leisure: 'relaxation', rest: 'relaxation', spa: 'relaxation', wellness: 'relaxation',
+  downtime: 'relaxation',
+  market: 'shopping', shop: 'shopping', bazaar: 'shopping', souvenir: 'shopping',
+  travel: 'transport', drive: 'transport', flight: 'transport', commute: 'transport',
+  driving: 'transport', train: 'transport', transfer: 'transport',
+  hotel: 'accommodation', stay: 'accommodation', lodging: 'accommodation',
+  checkin: 'accommodation',
+  scenic: 'nature', wildlife: 'nature', outdoors: 'nature', park: 'nature',
+  outdoor: 'nature', garden: 'nature', beach: 'nature',
+  bar: 'nightlife', club: 'nightlife', party: 'nightlife', entertainment: 'nightlife',
+};
 
-=== RULE 1: ACHIEVABILITY OVERRIDES EVERYTHING ===
-A plan that looks full but cannot be executed is worthless. A short, honest day is always better than a packed, impossible one.
-- Never compress travel time to make an activity fit. If it does not fit, drop it or move it to another day.
-- A day with 4 achievable entries is CORRECT. A day with 8 entries that requires teleporting is a FAILURE.
-- Never schedule an activity whose start_time is earlier than the previous end_time plus the real travel time between those two places.
+/** Look a single word up in both tables. */
+const lookup = (word) => {
+  if (!word) return null;
+  if (ACTIVITY_CATEGORIES.includes(word)) return word;
+  if (CATEGORY_SYNONYMS[word]) return CATEGORY_SYNONYMS[word];
+  // "markets", "sights", "drinks" — a plural of something already known.
+  const singular = word.replace(/s$/, '');
+  if (ACTIVITY_CATEGORIES.includes(singular)) return singular;
+  return CATEGORY_SYNONYMS[singular] || null;
+};
 
-=== RULE 2: TRAVEL TIME MUST BE REAL ===
-This is where itineraries most often go wrong. Think about the actual road, not the map distance.
-- Estimate travel from real road conditions between those two specific places, never straight-line distance.
-- Realistic average speeds, door to door:
-  * Hill / ghat / mountain roads (hairpins, forest, national parks): 25-30 km/h. A 40 km hill road is 1.5 HOURS, not 30 minutes.
-  * Dense city traffic: 15-20 km/h
-  * Ordinary town / suburban roads: 30-40 km/h
-  * Highways / expressways: 50-60 km/h
-  * Walking: 4 km/h, and only for hops under 2 km
-- Add to the driving time: parking, walking from the parking area to the site, ticket queues, and for peaks or trailheads the final rough stretch. This is often another 15-30 minutes.
-- Trailheads, hill peaks, waterfalls and viewpoints are usually far outside town and on slow roads. Assume 1-2 hours each way from a town centre unless you are confident it is genuinely closer.
-- WHEN IN DOUBT, OVERESTIMATE. Being 30 minutes early costs the traveler nothing; being 1 hour short ruins the day.
-- Any hop longer than 45 minutes must be its own entry with category "transport", with its own start_time and end_time, titled like "Drive to Mullayanagiri trailhead".
-- State the assumption in the notes of the entry you are travelling to, e.g. "approx 1h30 by car from the town centre on winding ghat road".
+export function normalizeCategory(value) {
+  const raw = String(value ?? '').toLowerCase().trim();
 
-=== RULE 3: REALISTIC DURATIONS ===
-- Major museum or palace: 2-3h
-- Landmark / temple / monument: 45min-1h30
-- Viewpoint or photo stop: 30-45min
-- Market or shopping street: 1-1h30
-- Sit-down meal: 1h (1h30 for dinner)
-- Park, garden or long walk: 1-2h
-- Short nature walk: 1-2h
-- Peak trek / summit hike: 3-5h ON THE MOUNTAIN, plus travel each way. This normally consumes an entire morning or an entire day - plan the rest of that day around it.
-- Waterfall or safari excursion: half a day minimum including travel.
+  // "food/drink", "food & drink", "Food - Dining" all start with a usable word,
+  // and so does "sightseeing|food|transport" — the format string echoed back
+  // instead of a choice being made from it.
+  return lookup(raw) || lookup(raw.split(/[^a-z]+/).filter(Boolean)[0]) || 'other';
+}
 
-=== RULE 4: GEOGRAPHY ===
-- One geographic cluster per day. Do not mix a far-out mountain excursion and a town-centre walking tour in the same morning.
-- Order each day as a loop that ends near where it started.
-- If a major sight is far from town, build the whole day around it rather than squeezing it between other things.
+/**
+ * System prompt for every planning call.
+ *
+ * Deliberately compact. The earlier version ran to roughly 1,280 tokens, and it
+ * was charged against the account's 8,000 tokens-per-minute allowance on every
+ * request — Groq counts prompt plus reserved completion before running anything.
+ * That left too little for the itinerary itself, which is why generation had to
+ * run at 'low' reasoning and still truncated on longer trips.
+ *
+ * This version is around 550 tokens and frees roughly 700 for output, which is
+ * what makes 'medium' reasoning affordable. Nothing load-bearing was dropped: the
+ * road-speed figures, the parking-and-walking overhead, the 45-minute transport
+ * rule including the return leg, the duration guidance, the three meals and the
+ * no-silent-gaps rule are all still stated. What went was repetition, restated
+ * emphasis, and a six-point self-check that repeated rules already given above it.
+ */
+export const REALISM_RULES = `You are WanderForge AI, an expert travel planner. Produce itineraries a real traveler can actually follow. Priority order: ACHIEVABLE first, then the most rewarding experience, then value for the budget.
 
-=== RULE 5: USE THE DAY WELL, WITHIN THE ABOVE ===
-- Aim to make good use of roughly 08:00 to 21:00, but only with entries that genuinely fit. Realism wins over filling time, always.
-- THE RETURN JOURNEY COUNTS. Coming back from a remote sight takes as long as going there. If the return is over 45 minutes it is its own "transport" entry - do not leave it as a silent gap.
-- Every day must include breakfast, lunch and dinner as entries. Adjust them around travel: if the traveler is on a mountain at 13:00, schedule a packed lunch or a stop en route rather than a town restaurant. Dinner is never omitted.
-- No unexplained gap over 45 minutes. Every gap must be either a "transport" entry or a real activity. If time is genuinely free near the traveler's base, use it for something easy and nearby - a cafe, a local market, a lakeside sunset, a stroll - never something that needs another long drive.
-- Outdoor and strenuous activities early; lighter activities later. After a long trek, keep the evening genuinely easy and close to base.
-- Respect real opening hours, last-entry times and weekly closures.
+ACHIEVABILITY OVERRIDES EVERYTHING. A packed impossible day is a failure; a shorter honest day is correct. Never compress travel time to make something fit — drop it or move it to another day. An activity's start_time must never precede the previous end_time plus the real travel time between those two places.
 
-=== FINAL SELF-CHECK (do this before answering) ===
-Walk through each day hour by hour and confirm:
-1. Every transition has enough time for the real journey, including parking and walking.
-2. No day requires being in two distant places within an impossible window.
-3. Any hop over 45 minutes appears as its own "transport" entry - INCLUDING the journey back.
-4. Treks, peaks and waterfalls have full travel time both ways.
-5. Breakfast, lunch and dinner are all present on every day.
-6. There is no unexplained gap over 45 minutes anywhere.
-If check 1-4 fails, REMOVE activities until the day is genuinely achievable - fewer, realistic entries is the correct outcome.
-If check 5-6 fails, ADD the missing meal, return journey, or an easy activity near the traveler's base.
+TRAVEL TIME MUST BE REAL — judge the actual road, never straight-line distance. Door-to-door averages: hill/ghat/forest roads 25-30 km/h (a 40 km hill road is 1.5 hours, not 30 minutes); dense city 15-20 km/h; town roads 30-40 km/h; highways 50-60 km/h; walking 4 km/h and only under 2 km. Then add 15-30 minutes for parking, walking in from the car, ticket queues, and the final rough stretch to peaks and trailheads. Trailheads, peaks, waterfalls and viewpoints are usually 1-2 hours each way from a town centre. When unsure, overestimate — being early costs nothing, being an hour short ruins the day. Any hop over 45 minutes is its own entry with category "transport" and its own times, titled like "Drive to Mullayanagiri trailhead", and THE RETURN JOURNEY COUNTS as its own entry too. Put the assumption in that entry's notes, e.g. "approx 1h30 by car on winding ghat road".
 
-Every entry must include estimated cost in local currency, a specific location name or address, and one practical tip.`;
+DURATIONS: museum/palace 2-3h; landmark/temple 45min-1h30; viewpoint 30-45min; market 1-1h30; sit-down meal 1h (1h30 dinner); park or nature walk 1-2h; peak trek 3-5h on the mountain plus travel each way, which consumes a whole morning or day; waterfall or safari excursion half a day minimum including travel.
+
+GEOGRAPHY: one geographic cluster per day, ordered as a loop ending near where it started. Never mix a far mountain excursion with a town-centre walk in the same morning. Build a whole day around a distant major sight.
+
+FILL THE DAY HONESTLY: aim to use roughly 08:00-21:00, but only with entries that genuinely fit. Breakfast, lunch and dinner every day, adjusted around travel — a packed lunch en route if the traveler is on a mountain at 13:00; dinner is never omitted. No unexplained gap over 45 minutes: make it a transport entry or a real activity, and if time is free near base use something easy and close by, never another long drive. Strenuous activities early, easy ones after a trek. Respect opening hours, last-entry times and weekly closures.
+
+EVERY ENTRY must include an estimated cost in local currency, a specific searchable location name or address, and one practical tip.
+
+Before answering, walk each day hour by hour and confirm every transition has time for the real journey including parking, that no day needs you in two distant places at once, that every hop over 45 minutes — both directions — is its own transport entry, and that all three meals are present. If it does not hold, remove activities until it does.`;
 
 export function preferencesBlock({ transportMode, budgetLevel, interests = [], notes = '' }) {
   return [

@@ -9,7 +9,7 @@ import {
   validateItinerary,
   validationRetryPrompt,
 } from '@/lib/itinerarySchema';
-import { ACTIVITY_CATEGORIES } from '@/lib/itineraryPrompt';
+import { ACTIVITY_CATEGORIES, normalizeCategory } from '@/lib/itineraryPrompt';
 
 /** A minimal activity that passes, so each test can vary one field. */
 const activity = (over = {}) => ({
@@ -134,8 +134,15 @@ describe('coerceCategory', () => {
     expect(coerceCategory('hiking')).toBe('adventure');
     expect(coerceCategory('hotel')).toBe('accommodation');
     expect(coerceCategory('drive')).toBe('transport');
-    expect(coerceCategory('Local Market')).toBe('other');
     expect(coerceCategory('markets')).toBe('shopping');
+    expect(coerceCategory('food/drink')).toBe('food');
+  });
+
+  it('is the same function the non-schema write paths use', () => {
+    // replanDay and the manual activity form write to the same
+    // CHECK-constrained column without passing through this schema. Two
+    // implementations would eventually give two answers.
+    expect(coerceCategory).toBe(normalizeCategory);
   });
 
   it('takes the first option when the model echoes the format string', () => {
@@ -150,6 +157,9 @@ describe('coerceCategory', () => {
 
   it('never yields a value outside the eleven', () => {
     const junk = ['', null, undefined, 42, '???', 'FOOD ', 'Night-Life'];
+    // An absent category becomes 'other'. Defaulting it to 'sightseeing' would
+    // be inventing a fact about the activity to make the row insertable.
+    expect(coerceCategory(null)).toBe('other');
     for (const v of junk) {
       expect(ACTIVITY_CATEGORIES).toContain(coerceCategory(v));
     }

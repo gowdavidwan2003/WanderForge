@@ -27,6 +27,7 @@ import { replanDay } from '@/lib/replanDay';
 import { geocodeBatch, unresolvedLocations } from '@/lib/geocodeClient';
 import { checkItinerary } from '@/lib/conflictChecker';
 import { conflictsForActivity, dayConflictSummary, worstSeverity } from '@/lib/conflictView';
+import { normalizeCategory } from '@/lib/itineraryPrompt';
 
 const CATEGORY_CONFIG = {
   sightseeing: { icon: '🏛️', color: '#6366F1', label: 'Sightseeing' },
@@ -495,7 +496,7 @@ export default function TripEditorPage({ params }) {
         title: act.title,
         description: act.description || '',
         location_name: act.location_name || '',
-        category: act.category || 'sightseeing',
+        category: normalizeCategory(act.category),
         start_time: act.start_time || null,
         end_time: act.end_time || null,
         cost: parseFloat(act.cost) || 0,

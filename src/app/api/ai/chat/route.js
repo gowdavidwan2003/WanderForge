@@ -1,6 +1,7 @@
 import { NextResponse } from 'next/server';
 import { groqChatCompletion } from '@/lib/groq';
 import { requireUser } from '@/lib/api/requireUser';
+import { CHAT_MODEL, CHAT_MAX_TOKENS, CHAT_REASONING_EFFORT } from '@/lib/groqModels';
 
 const CATEGORIES = [
   'sightseeing', 'food', 'transport', 'accommodation', 'adventure', 'shopping',
@@ -110,11 +111,13 @@ CHANGING THE ITINERARY:
 Keep responses concise and warm. Use emoji sparingly.`;
 
     const result = await groqChatCompletion({
-        model: 'llama-3.3-70b-versatile',
+        model: CHAT_MODEL,
         messages: [{ role: 'system', content: systemPrompt }, ...messages.slice(-10)],
         temperature: 0.6,
         tools: TOOLS,
         tool_choice: 'auto',
+        reasoning_effort: CHAT_REASONING_EFFORT,
+        max_completion_tokens: CHAT_MAX_TOKENS,
     }, { userApiKey });
 
     if (!result.ok) {

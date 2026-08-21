@@ -18,41 +18,9 @@
  */
 
 import { z } from 'zod';
-import { ACTIVITY_CATEGORIES } from '@/lib/itineraryPrompt';
+import { ACTIVITY_CATEGORIES, normalizeCategory } from '@/lib/itineraryPrompt';
 
 const pad = (n) => String(n).padStart(2, '0');
-
-/** The eleven values `activities.category` will accept, as a Set for lookups. */
-const CATEGORY_SET = new Set(ACTIVITY_CATEGORIES);
-
-/**
- * Words models reach for that are not one of the eleven categories.
- *
- * Clamping everything unrecognised to 'other' would be safe but lossy — a
- * restaurant filed under 'other' loses the meal, and the conflict checker's
- * opening-hour rules key off the category. These are the substitutions worth
- * making before falling back.
- */
-const CATEGORY_SYNONYMS = {
-  restaurant: 'food', dining: 'food', meal: 'food', breakfast: 'food',
-  lunch: 'food', dinner: 'food', cafe: 'food', coffee: 'food', drinks: 'food',
-  museum: 'culture', temple: 'culture', church: 'culture', historical: 'culture',
-  history: 'culture', heritage: 'culture', art: 'culture', religious: 'culture',
-  travel: 'transport', drive: 'transport', driving: 'transport', flight: 'transport',
-  train: 'transport', transfer: 'transport', commute: 'transport',
-  hotel: 'accommodation', stay: 'accommodation', lodging: 'accommodation',
-  check_in: 'accommodation', checkin: 'accommodation',
-  hike: 'adventure', hiking: 'adventure', trek: 'adventure', trekking: 'adventure',
-  sport: 'adventure', sports: 'adventure',
-  market: 'shopping', shop: 'shopping', souvenir: 'shopping', souvenirs: 'shopping',
-  bar: 'nightlife', club: 'nightlife', party: 'nightlife', entertainment: 'nightlife',
-  outdoors: 'nature', outdoor: 'nature', park: 'nature', wildlife: 'nature',
-  garden: 'nature', beach: 'nature', scenic: 'nature', viewpoint: 'nature',
-  spa: 'relaxation', rest: 'relaxation', leisure: 'relaxation', wellness: 'relaxation',
-  downtime: 'relaxation',
-  sight: 'sightseeing', sights: 'sightseeing', landmark: 'sightseeing',
-  tour: 'sightseeing', attraction: 'sightseeing', monument: 'sightseeing',
-};
 
 /** Strings that mean "no cost", as opposed to "cost unknown". */
 const ZERO_COST_WORDS = new Set([
@@ -155,29 +123,15 @@ export function coerceCost(value) {
 /**
  * Clamp a category to the eleven the database accepts.
  *
+ * Delegates to normalizeCategory rather than keeping a second table. The replan
+ * and manual-save paths do not go through this schema but write to the same
+ * CHECK-constrained column, so two implementations would mean two answers to the
+ * same question — and the one that drifted would be the one nobody was testing.
+ *
  * Never returns null: an unrecognised label is a naming problem, not a reason to
  * reject an otherwise usable activity, so it falls back to 'other'.
  */
-export function coerceCategory(value) {
-  if (value == null) return 'sightseeing';
-
-  const raw = String(value).trim().toLowerCase().replace(/[\s-]+/g, '_');
-  if (!raw) return 'sightseeing';
-
-  if (CATEGORY_SET.has(raw)) return raw;
-  if (CATEGORY_SYNONYMS[raw]) return CATEGORY_SYNONYMS[raw];
-
-  // "sightseeing|food|transport" — the model echoed the format string instead of
-  // choosing from it. Take the first option rather than filing the day as 'other'.
-  const first = raw.split('|')[0];
-  if (CATEGORY_SET.has(first)) return first;
-
-  const singular = raw.replace(/s$/, '');
-  if (CATEGORY_SET.has(singular)) return singular;
-  if (CATEGORY_SYNONYMS[singular]) return CATEGORY_SYNONYMS[singular];
-
-  return 'other';
-}
+export const coerceCategory = normalizeCategory;
 
 /** Free text: anything printable becomes a trimmed string, absent becomes ''. */
 const text = z.preprocess(

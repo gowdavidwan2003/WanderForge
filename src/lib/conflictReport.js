@@ -65,6 +65,34 @@ export function blockingIssues(issues = []) {
 }
 
 /**
+ * The itinerary restated as compactly as it can be and still be actionable.
+ *
+ * The re-prompt used to carry the model's own previous answer verbatim, which is
+ * the obvious way to give it context. It does not survive contact with the token
+ * ceiling: Groq counts prompt plus reserved completion against one 8,000 TPM
+ * allowance, and a 5-day itinerary echoed back as JSON is ~3,000 prompt tokens.
+ * That leaves too little budget to re-emit the itinerary, so the retry truncates
+ * — and a truncated retry looks exactly like a model that cannot follow
+ * instructions, while actually being a model that was never given room to answer.
+ *
+ * A digest is ~15 tokens per activity instead of ~100, and carries everything a
+ * rescheduling decision needs: which day, what order, what times, where.
+ */
+export function planDigest(itinerary = []) {
+  const lines = [];
+  for (const day of itinerary) {
+    lines.push(`Day ${day.day}:`);
+    for (const act of day.activities || []) {
+      const where = act.location_name && act.location_name !== act.title
+        ? ` @ ${act.location_name}`
+        : '';
+      lines.push(`  ${act.start_time}-${act.end_time} ${act.title}${where} [${act.category}]`);
+    }
+  }
+  return lines.join('\n');
+}
+
+/**
  * Name the conflicts back to the model.
  *
  * The checker's messages are already written for a person — they quote both
@@ -72,7 +100,7 @@ export function blockingIssues(issues = []) {
  * over verbatim rather than re-summarised. Telling the model only "day 2 has a
  * travel-time problem" is what produced the same broken day a second time.
  */
-export function conflictRetryPrompt(issues = []) {
+export function conflictRetryPrompt(issues = [], itinerary = []) {
   const blocking = blockingIssues(issues);
   if (blocking.length === 0) return null;
 
@@ -88,8 +116,14 @@ export function conflictRetryPrompt(issues = []) {
     for (const message of byDay.get(day)) lines.push(`  - ${message}`);
   }
 
+  const digest = planDigest(itinerary);
+
   return [
-    'Your itinerary was checked against real road distances and driving times, and these transitions do not work:',
+    'This is the itinerary you produced:',
+    '',
+    digest,
+    '',
+    'It was checked against real road distances and driving times, and these transitions do not work:',
     '',
     ...lines,
     '',

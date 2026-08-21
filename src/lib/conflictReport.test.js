@@ -5,6 +5,7 @@ import {
   checkGeneratedItinerary,
   conflictPayload,
   conflictRetryPrompt,
+  planDigest,
   toCheckerInput,
 } from '@/lib/conflictReport';
 
@@ -178,5 +179,58 @@ describe('conflictPayload', () => {
     );
     expect(payload.achievable).toBe(false);
     expect(payload.geocoded).toEqual({ located: 4, total: 5 });
+  });
+});
+
+describe('planDigest', () => {
+  const itinerary = [
+    {
+      day: 1,
+      activities: [
+        act({ title: 'Breakfast', category: 'food', location_name: 'Town Canteen', start_time: '08:00', end_time: '09:00' }),
+        act({ title: 'Mullayanagiri', category: 'nature', location_name: 'Mullayanagiri', start_time: '11:00', end_time: '13:00' }),
+      ],
+    },
+  ];
+
+  it('carries what a rescheduling decision needs', () => {
+    const digest = planDigest(itinerary);
+    expect(digest).toContain('Day 1:');
+    expect(digest).toContain('08:00-09:00 Breakfast @ Town Canteen [food]');
+    // Place omitted when it just repeats the title — those tokens buy nothing.
+    expect(digest).toContain('11:00-13:00 Mullayanagiri [nature]');
+    expect(digest).not.toContain('Mullayanagiri @ Mullayanagiri');
+  });
+
+  it('is far smaller than echoing the JSON back', () => {
+    // The reason it exists: prompt and reply share one 8,000 TPM allowance, so a
+    // verbatim echo leaves too little budget to re-emit the itinerary.
+    const digest = planDigest(itinerary);
+    expect(digest.length).toBeLessThan(JSON.stringify(itinerary).length / 3);
+  });
+
+  it('survives an empty or malformed plan', () => {
+    expect(planDigest([])).toBe('');
+    expect(planDigest([{ day: 1 }])).toBe('Day 1:');
+  });
+});
+
+describe('conflictRetryPrompt with the plan', () => {
+  it('shows the model what it produced, in digest form', () => {
+    const prompt = conflictRetryPrompt(
+      [{ severity: 'error', type: 'travel-time', day: 1, message: 'Short by 50m.' }],
+      [{ day: 1, activities: [act({ title: 'Peak', start_time: '09:00', end_time: '11:00' })] }]
+    );
+
+    expect(prompt).toContain('This is the itinerary you produced:');
+    expect(prompt).toContain('09:00-11:00 Peak');
+    expect(prompt).toContain('Short by 50m.');
+  });
+
+  it('still works when no plan is passed', () => {
+    const prompt = conflictRetryPrompt([
+      { severity: 'error', type: 'overlap', day: 2, message: 'They overlap.' },
+    ]);
+    expect(prompt).toContain('They overlap.');
   });
 });
