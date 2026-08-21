@@ -5,6 +5,7 @@ import { requireUser } from '@/lib/api/requireUser';
 import { clampRequestedDays } from '@/lib/tripLimits';
 import { validateItinerary, validationRetryPrompt } from '@/lib/itinerarySchema';
 import { geocodeItinerary } from '@/lib/placeLookup';
+import { getGeocodeCacheClients } from '@/lib/api/geocodeCacheClients';
 import {
   blockingIssues,
   checkGeneratedItinerary,
@@ -241,9 +242,18 @@ ${FORMAT_BLOCK}`;
       currency: plan.currency || '',
     };
 
-    let geo = { itinerary: plan.itinerary, located: 0, total: 0, coords: new Map() };
+    // Cache-first, and shared across users: a destination somebody has already
+    // planned should reach Google zero times. Places is ~300x the cost of the
+    // completion that produced this plan.
+    const cache = await getGeocodeCacheClients();
+
+    let geo = { itinerary: plan.itinerary, located: 0, total: 0, hits: new Map(), stats: null };
     if (budget.canAfford(MIN_GEOCODE_MS)) {
-      geo = await geocodeItinerary(plan.itinerary, { near, deadlineAt: budget.deadlineAt() });
+      geo = await geocodeItinerary(plan.itinerary, {
+        near,
+        deadlineAt: budget.deadlineAt(),
+        cache,
+      });
     }
 
     let check = checkGeneratedItinerary(geo.itinerary, tripShape);
@@ -264,11 +274,12 @@ ${FORMAT_BLOCK}`;
             ? await geocodeItinerary(revalidated.data.itinerary, {
                 near,
                 deadlineAt: budget.deadlineAt(),
+                cache,
                 // Most places survive a re-plan, and a lookup already paid for
-                // must not be paid for twice.
-                known: geo.coords,
+                // must not be paid for twice — not even against the cache.
+                known: geo.hits,
               })
-            : { itinerary: revalidated.data.itinerary, located: 0, total: 0, coords: geo.coords };
+            : { itinerary: revalidated.data.itinerary, located: 0, total: 0, hits: geo.hits };
 
           const reCheck = checkGeneratedItinerary(reGeo.itinerary, tripShape);
 
@@ -293,7 +304,7 @@ ${FORMAT_BLOCK}`;
       itinerary: geo.itinerary,
       conflicts: conflictPayload(check, {
         attempts: completions,
-        geocoded: { located: geo.located, total: geo.total },
+        geocoded: { located: geo.located, total: geo.total, ...(geo.stats || {}) },
       }),
     });
   } catch (err) {

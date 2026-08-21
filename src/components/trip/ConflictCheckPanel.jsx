@@ -2,177 +2,162 @@
 
 import Modal from '@/components/ui/Modal';
 import Button from '@/components/ui/Button';
+import { groupByDay, headlineFor, isHardConflict } from '@/lib/conflictView';
 
 /**
  * Itinerary Check.
  *
- * Two states, on purpose.
+ * This was a "Coming soon" modal sitting on top of a checker that already
+ * worked. It now shows the live result of checkItinerary over whatever is
+ * currently in the editor — recomputed on every edit, no network, no AI — split
+ * into what cannot work and what is merely worth a look.
  *
- * When the trip carries a stored check — written by the generate route, which
- * runs conflictChecker server-side against real road distances before anything
- * reaches the database — this shows what survived the model's one chance to fix
- * it. That is the part that must never be silent: an itinerary that cannot be
- * walked has to say so.
+ * The panel is not the only place conflicts appear: activities carry their own
+ * marks in the day view and days carry a badge in the sidebar, so a problem is
+ * visible where it is, not only in a modal somebody has to think to open. What
+ * the panel adds is the whole-trip picture and a per-day fix button.
  *
- * When it does not (a hand-built trip, or one generated before the check
- * existed), the panel still explains what the check does rather than being a
- * dead button. Re-running it live on demand, and the one-click whole-trip fix
- * behind it, are still held back — the checker and replanTrip are both built, so
- * that is a UI change rather than a rebuild.
+ * Travel times come from the checker's road model (great-circle distance scaled
+ * for road sinuosity), not from a routing call — the same basis the generate
+ * route checks against, and free to recompute on every keystroke.
  */
-
-const PLANNED = [
-  {
-    icon: '⛔',
-    title: 'Overlapping activities',
-    text: 'Spots two things booked at the same time, and by how much they clash.',
-  },
-  {
-    icon: '🚗',
-    title: 'Impossible travel times',
-    text: 'Uses real road distances and driving times to flag journeys that cannot fit the gap you have left — the kind where a 1h30 ghat road is scheduled in 30 minutes.',
-  },
-  {
-    icon: '🕐',
-    title: 'Opening-hour concerns',
-    text: 'Flags museums at 06:00 and other slots that are unlikely to be open.',
-  },
-  {
-    icon: '💰',
-    title: 'Over-budget days',
-    text: 'Highlights days that run well past the daily average implied by your trip budget.',
-  },
-  {
-    icon: '🗺️',
-    title: 'Unrealistic distances',
-    text: 'Warns when a single day covers more ground than is sensible, or when one hop is a long haul.',
-  },
-  {
-    icon: '🔄',
-    title: 'One-click whole-trip fix',
-    text: 'Rebuilds the trip around every place you have added — moving them between days where needed — without ever dropping one.',
-  },
-];
 
 const SEVERITY_ICON = { error: '⛔', warning: '⚠️', info: 'ℹ️' };
 
-function checkedAgo(iso) {
-  if (!iso) return null;
-  const when = new Date(iso);
-  if (Number.isNaN(when.getTime())) return null;
-  return when.toLocaleString(undefined, { dateStyle: 'medium', timeStyle: 'short' });
+const TYPE_LABEL = {
+  overlap: 'Overlapping',
+  'invalid-duration': 'Impossible duration',
+  'travel-time': 'Not enough travel time',
+  'long-hop': 'Long haul',
+  'odd-hours': 'Opening hours',
+  'over-budget': 'Over budget',
+  'long-day': 'Long day',
+  'missing-times': 'No times set',
+  'missing-coords': 'Not on the map',
+};
+
+function IssueRow({ issue }) {
+  return (
+    <div className={`cc__item cc__item--${issue.severity}`}>
+      <span className="cc__item-icon">{SEVERITY_ICON[issue.severity] || 'ℹ️'}</span>
+      <div>
+        <span className="cc__item-title">{TYPE_LABEL[issue.type] || issue.type}</span>
+        <p className="cc__item-text">{issue.message}</p>
+      </div>
+    </div>
+  );
 }
 
-/** What the last server-side check found. */
-function StoredReport({ conflicts, checkedAt }) {
-  const issues = Array.isArray(conflicts.issues) ? conflicts.issues : [];
-  const summary = conflicts.summary || {};
-  const when = checkedAgo(checkedAt);
-
+function DaySection({ group, onFixDay, fixingDay, disabled }) {
   return (
-    <div className="cc">
-      <div className={`cc__badge cc__badge--${conflicts.achievable ? 'ok' : 'bad'}`}>
-        {conflicts.achievable ? 'Achievable' : 'Not fully achievable'}
-      </div>
+    <section className="cc__day">
+      <header className="cc__day-head">
+        <span className="cc__day-title">
+          Day {group.day}
+          {group.impossible && <span className="cc__pill cc__pill--bad">Impossible as written</span>}
+        </span>
 
-      <p className="cc__intro">
-        {conflicts.achievable
-          ? 'Every transition in this itinerary has enough time for the real journey between those two places.'
-          : 'Some transitions in this itinerary do not have enough time for the real journey between those two places. The plan was checked against road distances and driving times, and the AI was given one chance to fix these — these are what it could not.'}
-        {when ? ` Checked ${when}.` : ''}
-      </p>
-
-      <div className="cc__stats">
-        <span className="cc__stat">{summary.errors ?? 0} errors</span>
-        <span className="cc__stat">{summary.warnings ?? 0} warnings</span>
-        <span className="cc__stat">{summary.info ?? 0} notes</span>
-        {conflicts.geocoded && (
-          <span className="cc__stat">
-            {conflicts.geocoded.located}/{conflicts.geocoded.total} located
-          </span>
+        {/* Only offered where it helps. Replan rebuilds a day's order and
+            timings around everything on it; it cannot fix a museum's opening
+            hours, so offering it for a soft warning would be a false promise. */}
+        {group.impossible && (
+          <Button
+            size="sm"
+            variant="secondary"
+            onClick={() => onFixDay(group.day)}
+            loading={fixingDay === group.day}
+            disabled={disabled || fixingDay != null}
+            title="Rebuild this day around everything on it: order, timings and travel"
+          >
+            🔄 Fix this day
+          </Button>
         )}
-      </div>
+      </header>
 
-      {conflicts.geocoded && conflicts.geocoded.located < conflicts.geocoded.total && (
-        <p className="cc__note">
-          {conflicts.geocoded.total - conflicts.geocoded.located} activity(s) could not
-          be placed on the map, so travel time to and from them could not be checked.
-          An unchecked leg is not the same as one that works.
-        </p>
-      )}
-
-      {issues.length === 0 ? (
-        <p className="cc__note">Nothing to flag.</p>
-      ) : (
-        <div className="cc__list">
-          {issues.map((issue, i) => (
-            <div key={`${issue.type}-${issue.day}-${i}`} className={`cc__item cc__item--${issue.severity}`}>
-              <span className="cc__item-icon">{SEVERITY_ICON[issue.severity] || 'ℹ️'}</span>
-              <div>
-                <span className="cc__item-title">Day {issue.day} · {issue.type.replace(/-/g, ' ')}</span>
-                <p className="cc__item-text">{issue.message}</p>
-              </div>
-            </div>
-          ))}
-        </div>
-      )}
-
-      <p className="cc__foot">
-        This is what was true when the itinerary was generated. Edit a day and it
-        may no longer apply — <strong>Replan Day</strong> rebuilds a day with
-        realistic travel times and ordering.
-      </p>
-    </div>
+      {group.hard.map((issue, i) => <IssueRow key={`h${i}`} issue={issue} />)}
+      {group.soft.map((issue, i) => <IssueRow key={`s${i}`} issue={issue} />)}
+    </section>
   );
 }
 
-/** What the check will do, for trips that have never had one. */
-function ComingSoon() {
-  return (
-    <div className="cc">
-      <div className="cc__badge">Not checked yet</div>
+export default function ConflictCheckPanel({
+  isOpen,
+  onClose,
+  report,
+  trip,
+  onFixDay,
+  fixingDay = null,
+  locked = false,
+}) {
+  const issues = report?.issues || [];
+  const summary = report?.summary || {};
+  const headline = headlineFor(report);
+  const groups = groupByDay(issues);
+  const hardCount = issues.filter(isHardConflict).length;
 
-      <p className="cc__intro">
-        This trip has no stored check. Itineraries generated with AI are checked
-        automatically before they are saved; running the check on demand for a
-        hand-built trip is not switched on yet.
-      </p>
-
-      <div className="cc__list">
-        {PLANNED.map((item) => (
-          <div key={item.title} className="cc__item">
-            <span className="cc__item-icon">{item.icon}</span>
-            <div>
-              <span className="cc__item-title">{item.title}</span>
-              <p className="cc__item-text">{item.text}</p>
-            </div>
-          </div>
-        ))}
-      </div>
-
-      <p className="cc__foot">
-        In the meantime, <strong>Replan Day</strong> on any day rebuilds it with
-        realistic travel times and ordering.
-      </p>
-    </div>
-  );
-}
-
-export default function ConflictCheckPanel({ isOpen, onClose, trip }) {
-  const conflicts = trip?.conflicts;
+  // What the check found when the itinerary was generated. Shown only when it
+  // disagrees with the live result, because that is the only time it tells the
+  // reader something: the plan has been edited since.
+  const stored = trip?.conflicts;
+  const storedDiffers =
+    stored && typeof stored.achievable === 'boolean' && stored.achievable !== (hardCount === 0);
 
   return (
     <Modal isOpen={isOpen} onClose={onClose} title="Itinerary Check" size="lg">
-      {conflicts
-        ? <StoredReport conflicts={conflicts} checkedAt={trip?.conflicts_checked_at} />
-        : <ComingSoon />}
+      <div className="cc">
+        <div className={`cc__badge cc__badge--${headline.tone}`}>{headline.title}</div>
+        <p className="cc__intro">{headline.detail}</p>
 
-      <div className="cc__actions">
-        <Button variant="primary" onClick={onClose}>Got it</Button>
+        <div className="cc__stats">
+          <span className="cc__stat">{summary.checkedDays ?? 0} days checked</span>
+          <span className="cc__stat">{summary.checkedActivities ?? 0} activities</span>
+          <span className="cc__stat">{summary.errors ?? 0} errors</span>
+          <span className="cc__stat">{summary.warnings ?? 0} warnings</span>
+        </div>
+
+        {storedDiffers && (
+          <p className="cc__note">
+            This differs from the check stored when the itinerary was generated —
+            the plan has been edited since. The result above is the current one.
+          </p>
+        )}
+
+        {locked && hardCount > 0 && (
+          <p className="cc__note">
+            The itinerary is locked, so it cannot be fixed until the trip owner
+            unlocks it.
+          </p>
+        )}
+
+        {groups.length === 0 ? (
+          <p className="cc__note">Nothing to flag.</p>
+        ) : (
+          groups.map((group) => (
+            <DaySection
+              key={group.day}
+              group={group}
+              onFixDay={onFixDay}
+              fixingDay={fixingDay}
+              disabled={locked}
+            />
+          ))
+        )}
+
+        <p className="cc__foot">
+          Travel times are estimated from road distance, not a live routing call,
+          and opening hours are judged by category rather than looked up — so a
+          warning is worth confirming, not obeying. Anything marked{' '}
+          <strong>impossible</strong> is arithmetic: the journey does not fit the
+          gap left for it.
+        </p>
+
+        <div className="cc__actions">
+          <Button variant="primary" onClick={onClose}>Done</Button>
+        </div>
       </div>
 
       {/* `global`, not scoped: styled-jsx scopes to the JSX of the component the
-          block sits in, and the markup above lives in StoredReport / ComingSoon.
+          block sits in, and IssueRow / DaySection are separate components.
           Every class is cc-prefixed to keep the leak contained. */}
       <style jsx global>{`
         .cc { display: flex; flex-direction: column; gap: var(--space-4); }
@@ -184,6 +169,7 @@ export default function ConflictCheckPanel({ isOpen, onClose, trip }) {
           text-transform: uppercase; letter-spacing: 0.05em;
         }
         .cc__badge--ok { background: var(--color-success-bg); color: var(--color-success); }
+        .cc__badge--warn { background: var(--color-warning-bg, var(--color-info-bg)); color: var(--color-warning); }
         .cc__badge--bad { background: var(--color-error-bg); color: var(--color-error); }
         .cc__intro { font-size: var(--text-sm); color: var(--color-text-secondary); }
         .cc__stats { display: flex; flex-wrap: wrap; gap: var(--space-2); }
@@ -193,7 +179,22 @@ export default function ConflictCheckPanel({ isOpen, onClose, trip }) {
           font-size: var(--text-xs); color: var(--color-text-secondary);
         }
         .cc__note { font-size: var(--text-xs); color: var(--color-text-tertiary); }
-        .cc__list { display: flex; flex-direction: column; gap: var(--space-3); }
+        .cc__day { display: flex; flex-direction: column; gap: var(--space-2); }
+        .cc__day-head {
+          display: flex; align-items: center; justify-content: space-between;
+          gap: var(--space-2);
+          border-bottom: 1px solid var(--color-border-light); padding-bottom: 4px;
+        }
+        .cc__day-title {
+          display: flex; align-items: center; gap: var(--space-2);
+          font-size: var(--text-sm); font-weight: 600;
+        }
+        .cc__pill {
+          padding: 2px 8px; border-radius: 999px;
+          font-size: 10px; font-weight: 700; text-transform: uppercase;
+          letter-spacing: 0.04em;
+        }
+        .cc__pill--bad { background: var(--color-error-bg); color: var(--color-error); }
         .cc__item {
           display: flex; gap: var(--space-3);
           padding: var(--space-3); border-radius: var(--radius-md);
@@ -203,20 +204,15 @@ export default function ConflictCheckPanel({ isOpen, onClose, trip }) {
         .cc__item--error { border-left-color: var(--color-error); }
         .cc__item--warning { border-left-color: var(--color-warning); }
         .cc__item-icon { flex-shrink: 0; font-size: 18px; }
-        .cc__item-title {
-          font-size: var(--text-sm); font-weight: 600;
-          text-transform: capitalize;
-        }
+        .cc__item-title { font-size: var(--text-sm); font-weight: 600; }
         .cc__item-text {
           font-size: var(--text-xs); color: var(--color-text-tertiary); margin-top: 2px;
         }
         .cc__foot {
-          font-size: var(--text-sm); color: var(--color-text-tertiary);
+          font-size: var(--text-xs); color: var(--color-text-tertiary);
           border-top: 1px solid var(--color-border-light); padding-top: var(--space-3);
         }
-        .cc__actions {
-          display: flex; justify-content: flex-end; margin-top: var(--space-4);
-        }
+        .cc__actions { display: flex; justify-content: flex-end; }
       `}</style>
     </Modal>
   );

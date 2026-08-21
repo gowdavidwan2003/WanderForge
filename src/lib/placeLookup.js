@@ -1,19 +1,46 @@
 /**
- * Server-side place lookup.
+ * Server-side place lookup, cached and batched.
  *
  * Lifted out of /api/geocode so the generate route can resolve coordinates
  * before it validates a plan. That matters because the conflict checker's whole
  * job — is the journey between these two places possible in the gap left for it
- * — needs coordinates, and until now the only geocoding happened in the browser
- * *after* everything had already been written.
+ * — needs coordinates, and geocoding used to happen in the browser only *after*
+ * everything had already been written.
  *
  * Nominatim geocodes addresses, not businesses — it could not find "The Planters
  * Court", "Hirekolale Lake" or even "Chikmagaluru" (OSM indexes that city as
  * "Chikmagalur"). Google Places Text Search handles venue names and spelling
  * variants, so it is tried first, with Nominatim kept as a no-key fallback.
  *
+ * Everything goes through resolvePlaces, which is batched and cache-backed.
+ * Places is ~$0.032 a call and the app was making around 41 of them per 5-day
+ * generation, re-resolving the same place names on every regenerate and replan —
+ * about 300x the cost of the Groq completion that produced the itinerary, and
+ * unlike Groq it never fails closed.
+ *
  * Server-side only: these calls carry the operator's Google key.
  */
+
+import {
+  cacheKey,
+  normaliseQuery,
+  readCache,
+  toHit,
+  toRow,
+  writeCache,
+} from '@/lib/geocodeCache';
+
+/** How many lookups may be in flight at once against Google. */
+const GEOCODE_CONCURRENCY = 6;
+
+/**
+ * Ceiling on a single lookup.
+ *
+ * A deadline stops the pool *starting* work, but a request already in flight
+ * against a hung provider would sail past it — and the generate route's budget
+ * exists so the platform never kills the invocation mid-flight.
+ */
+const LOOKUP_TIMEOUT_MS = 6_000;
 
 /** One Google Places Text Search, biased toward the trip's destination. */
 export async function googlePlaces(apiKey, query, near, { signal } = {}) {
@@ -73,90 +100,79 @@ export async function nominatim(query, { signal } = {}) {
 }
 
 /**
- * Resolve one query to coordinates, Google first then Nominatim.
+ * Resolve many place names at once.
  *
- * @returns {{results: object[], source: string}} — empty results rather than a
- *          throw, because a place that cannot be found is a normal outcome.
- */
-export async function lookupPlace(query, near = null, { signal } = {}) {
-  const googleKey = process.env.GOOGLE_MAPS_API_KEY;
-
-  if (googleKey) {
-    try {
-      const hit = await googlePlaces(googleKey, query, near, { signal });
-      if (hit) return { results: [hit], source: 'google' };
-    } catch (err) {
-      console.warn('[WanderForge] Google Places unavailable, trying Nominatim:', err.message);
-    }
-  }
-
-  const results = await nominatim(query, { signal });
-  return { results, source: 'nominatim' };
-}
-
-/** How many lookups may be in flight at once against Google. */
-const GEOCODE_CONCURRENCY = 6;
-
-/**
- * Ceiling on a single lookup.
+ * The order of operations is the cost fix: normalise and dedupe, then one cache
+ * read for the whole batch, then Google for whatever is left — pooled, not the
+ * sequential await-inside-a-nested-loop this replaces. A generation for a
+ * destination somebody has already planned should reach Google zero times.
  *
- * The deadline stops the pool *starting* work, but a request already in flight
- * against a hung provider would sail past it — and the route's whole budget
- * exists so the platform never kills the invocation mid-flight.
- */
-const LOOKUP_TIMEOUT_MS = 6_000;
-
-/** Same place name written two ways is still one billable lookup. */
-const cacheKey = (name) => String(name).trim().toLowerCase().replace(/\s+/g, ' ');
-
-/**
- * Attach coordinates to every activity in a validated itinerary.
+ * Never throws. A place that cannot be resolved comes back as null, which
+ * downstream becomes a 'missing-coords' note rather than a failed generation.
  *
- * Returns a NEW itinerary rather than mutating, and never throws: an activity
- * that cannot be located keeps `latitude`/`longitude` null, which the conflict
- * checker reports as an unverifiable leg rather than a clean bill of health.
- *
- * Only runs when a Google key is configured. Nominatim asks for at most one
- * request per second, and a 7-day itinerary is fifty-odd places — hammering it
- * from a server would be abuse, and doing it serially would blow the route's
- * time budget. Without a key the browser keeps geocoding as it always has, one
- * activity at a time.
- *
- * @param itinerary   validated `data.itinerary`
- * @param near        destination coordinates to bias toward, when known
+ * @param queries     place names, in any casing, with duplicates
+ * @param near        coordinates to bias toward, when known
  * @param deadlineAt  epoch ms after which no new lookup is started
- * @param known       pre-resolved coordinates by place name, from an earlier pass
- * @returns {{itinerary: array, located: number, total: number, coords: Map}}
+ * @param cache       { supabase, admin } — read client and service-role writer
+ * @param known       already-resolved coordinates by normalised query
+ * @returns {{hits: Map, stats: {requested, unique, fromCache, fromProvider, missed}}}
  */
-export async function geocodeItinerary(
-  itinerary,
-  { near = null, deadlineAt = Infinity, known = new Map() } = {}
+export async function resolvePlaces(
+  queries = [],
+  { near = null, deadlineAt = Infinity, cache = null, known = new Map() } = {}
 ) {
-  const coords = new Map(known);
-  const activities = itinerary.flatMap((day) => day.activities);
-  const total = activities.length;
-  const googleKey = process.env.GOOGLE_MAPS_API_KEY;
+  const hits = new Map(known);
+  const stats = { requested: 0, unique: 0, fromCache: 0, fromProvider: 0, missed: 0 };
 
-  if (!googleKey) {
-    return { itinerary, located: 0, total, coords, skipped: 'no-google-key' };
+  const wanted = [];
+  for (const q of queries) {
+    const norm = normaliseQuery(q);
+    if (!norm) continue;
+    stats.requested++;
+    if (!hits.has(norm) && !wanted.includes(norm)) wanted.push(norm);
+  }
+  stats.unique = wanted.length;
+  if (wanted.length === 0) return { hits, stats };
+
+  // --- 1. One round trip for the whole batch ---------------------------
+  const cached = await readCache(
+    cache?.supabase,
+    wanted.map((q) => cacheKey(q, near))
+  );
+
+  const misses = [];
+  for (const norm of wanted) {
+    const row = cached.get(cacheKey(norm, near));
+    if (!row) {
+      misses.push(norm);
+      continue;
+    }
+    stats.fromCache++;
+    // A cached miss is still a cache hit. An unfindable place name is re-asked
+    // on every regenerate, and Google bills for those answers too.
+    const hit = toHit(row);
+    if (hit) hits.set(norm, hit);
+    else stats.missed++;
   }
 
-  const pending = [
-    ...new Set(
-      activities
-        .map((a) => a.location_name)
-        .filter(Boolean)
-        .map(cacheKey)
-        .filter((k) => !coords.has(k))
-    ),
-  ];
+  if (misses.length === 0) return { hits, stats };
 
-  // A fixed-size pool rather than one giant Promise.all: fifty simultaneous
-  // requests is how a per-minute Places quota gets tripped in one keystroke.
+  const googleKey = process.env.GOOGLE_MAPS_API_KEY;
+  if (!googleKey) {
+    // Nominatim asks for at most one request per second, and a 7-day itinerary
+    // is fifty-odd places. Batching that from a server would be abuse, so
+    // without a Google key the browser keeps resolving one at a time.
+    stats.missed += misses.length;
+    return { hits, stats, skipped: 'no-google-key' };
+  }
+
+  // --- 2. Pool the misses, bounded by the caller's deadline -------------
+  const resolved = [];
   let cursor = 0;
+
   const worker = async () => {
-    while (cursor < pending.length) {
-      const key = pending[cursor++];
+    while (cursor < misses.length) {
+      const norm = misses[cursor++];
       if (Date.now() >= deadlineAt) return;
 
       const controller = new AbortController();
@@ -167,15 +183,21 @@ export async function geocodeItinerary(
 
       try {
         // googlePlaces rather than lookupPlace: the Nominatim fallback is
-        // deliberately not reachable from here, so a Google failure on one place
-        // cannot quietly turn into fifty server-side Nominatim requests.
-        const hit = await googlePlaces(googleKey, key, near, { signal: controller.signal });
+        // deliberately not reachable from a batch, so one Google failure cannot
+        // quietly become fifty server-side Nominatim requests.
+        const hit = await googlePlaces(googleKey, norm, near, { signal: controller.signal });
+        stats.fromProvider++;
         if (hit && Number.isFinite(hit.lat) && Number.isFinite(hit.lng)) {
-          coords.set(key, { lat: hit.lat, lng: hit.lng });
+          hits.set(norm, hit);
+          resolved.push(toRow(norm, near, hit));
+        } else {
+          stats.missed++;
+          resolved.push(toRow(norm, near, null));
         }
       } catch {
-        // An unlocatable place is not a failed generation. It becomes a
-        // 'missing-coords' note on the checked itinerary instead.
+        // A transport failure is not a confirmed miss, so it is NOT cached —
+        // caching it would make one bad minute cost the place for 30 days.
+        stats.missed++;
       } finally {
         clearTimeout(timer);
       }
@@ -183,18 +205,78 @@ export async function geocodeItinerary(
   };
 
   await Promise.all(
-    Array.from({ length: Math.min(GEOCODE_CONCURRENCY, pending.length) }, worker)
+    Array.from({ length: Math.min(GEOCODE_CONCURRENCY, misses.length) }, worker)
   );
+
+  // --- 3. Pay this bill once ------------------------------------------
+  await writeCache(cache?.admin, resolved);
+
+  return { hits, stats };
+}
+
+/**
+ * Resolve one query, Google first then Nominatim.
+ *
+ * The single-query path behind /api/geocode's GET, kept because Nominatim is a
+ * usable fallback for one interactive lookup even though it is not for a batch.
+ *
+ * @returns {{results: object[], source: string}} — empty results rather than a
+ *          throw, because a place that cannot be found is a normal outcome.
+ */
+export async function lookupPlace(query, near = null, { cache = null } = {}) {
+  const { hits, stats } = await resolvePlaces([query], { near, cache });
+  const hit = hits.get(normaliseQuery(query));
+
+  if (hit) return { results: [hit], source: hit.cached ? 'cache' : hit.source };
+
+  // Only fall back when Google was never asked. If Google answered and found
+  // nothing, that answer is cached and asking Nominatim would undo it.
+  if (stats.fromProvider === 0 && stats.fromCache === 0) {
+    const results = await nominatim(query);
+    return { results, source: 'nominatim' };
+  }
+
+  return { results: [], source: 'google' };
+}
+
+/**
+ * Attach coordinates to every activity in a validated itinerary.
+ *
+ * Returns a NEW itinerary rather than mutating, and never throws: an activity
+ * that cannot be located keeps `latitude`/`longitude` null, which the conflict
+ * checker reports as an unverifiable leg rather than a clean bill of health.
+ *
+ * Activities that already carry coordinates are left alone — a replan keeps most
+ * of its places, and re-resolving them is the same lookup paid for twice.
+ *
+ * @returns {{itinerary: array, located: number, total: number, hits: Map, stats: object}}
+ */
+export async function geocodeItinerary(
+  itinerary,
+  { near = null, deadlineAt = Infinity, known = new Map(), cache = null } = {}
+) {
+  const activities = itinerary.flatMap((day) => day.activities);
+  const total = activities.length;
+
+  const queries = activities
+    .filter((a) => a.location_name && !Number.isFinite(a.latitude))
+    .map((a) => a.location_name);
+
+  const { hits, stats } = await resolvePlaces(queries, { near, deadlineAt, known, cache });
 
   let located = 0;
   const withCoords = itinerary.map((day) => ({
     ...day,
     activities: day.activities.map((act) => {
-      const hit = act.location_name ? coords.get(cacheKey(act.location_name)) : null;
+      if (Number.isFinite(act.latitude) && Number.isFinite(act.longitude)) {
+        located++;
+        return act;
+      }
+      const hit = act.location_name ? hits.get(normaliseQuery(act.location_name)) : null;
       if (hit) located++;
       return { ...act, latitude: hit?.lat ?? null, longitude: hit?.lng ?? null };
     }),
   }));
 
-  return { itinerary: withCoords, located, total, coords };
+  return { itinerary: withCoords, located, total, hits, stats };
 }
