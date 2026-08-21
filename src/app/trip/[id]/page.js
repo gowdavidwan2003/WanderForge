@@ -86,6 +86,10 @@ export default function TripEditorPage({ params }) {
   // Lets the Cancel button reach the in-flight request. Aborting closes the SSE
   // connection, which the route treats as "stop paying Groq".
   const generateAbortRef = useRef(null);
+  // One-shot latch for the hand-off from the wizard. A ref, not state: it must
+  // be checked and cleared synchronously, or a second render fires a second
+  // generation before the first has set anything.
+  const autoGenerateRef = useRef(false);
   const [pendingGenerate, setPendingGenerate] = useState(null);
   // Guards against a double-click landing before the aiGenerating state commits.
   const generatingRef = useRef(false);
@@ -175,6 +179,25 @@ export default function TripEditorPage({ params }) {
   useEffect(() => {
     stateRef.current = { days, activities };
   });
+
+  /**
+   * Pick up the hand-off from the wizard.
+   *
+   * Read and cleared immediately, so a refresh cannot start a second
+   * generation, and scoped to this trip id so it cannot fire on a different
+   * trip the user happens to open next. sessionStorage rather than a query
+   * parameter for exactly that reason — `?generate=1` survives a reload.
+   */
+  useEffect(() => {
+    try {
+      if (sessionStorage.getItem('wf-autogenerate') === id) {
+        sessionStorage.removeItem('wf-autogenerate');
+        autoGenerateRef.current = true;
+      }
+    } catch {
+      // Private mode, or storage blocked. The Generate button still works.
+    }
+  }, [id]);
 
   const { onlineUsers } = useRealtimeTrip(id, handleRealtimeUpdate, days.map(d => d.id));
 
@@ -988,6 +1011,37 @@ export default function TripEditorPage({ params }) {
     generateAbortRef.current.abort();
     toast.info('Generation stopped. Your itinerary is unchanged.', 'Cancelled');
   };
+
+  /**
+   * Start the generation the wizard asked for.
+   *
+   * Deliberately conditioned on the trip being EMPTY, not just on the latch.
+   * Auto-generating over an itinerary somebody already has is the
+   * duplicate-write failure the confirmation dialog exists to prevent, and a
+   * latch that somehow survived would otherwise do it silently.
+   *
+   * Waits for days to load, because runGenerate reads them to place activities.
+   */
+  useEffect(() => {
+    if (!autoGenerateRef.current) return;
+    if (loading || !trip || days.length === 0) return;
+    if (generatingRef.current) return;
+
+    const existing = Object.values(activities).flat().length;
+    // trip.itinerary_locked rather than the isLocked derived below: that const
+    // is declared after the early returns, so referencing it here works only by
+    // the accident of this effect guarding on `loading` first.
+    if (existing > 0 || trip.itinerary_locked) {
+      autoGenerateRef.current = false;
+      return;
+    }
+
+    autoGenerateRef.current = false;
+    runGenerate('replace');
+    // Fires once, on the transition into "loaded and empty". The ref is cleared
+    // above before anything async starts, so a re-render cannot re-enter.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [loading, trip, days.length]);
 
   const handleAIGenerate = () => {
     if (!trip) return;
