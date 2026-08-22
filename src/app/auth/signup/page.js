@@ -6,6 +6,7 @@ import { useAuth } from '@/context/AuthProvider';
 import { useToast } from '@/components/ui/Toast';
 import Button from '@/components/ui/Button';
 import Input from '@/components/ui/Input';
+import { isValidEmail } from '@/lib/validateEmail';
 
 export default function SignupPage() {
   // Confirmation happens by clicking the link in the email, which lands on
@@ -25,6 +26,10 @@ export default function SignupPage() {
     const errs = {};
     if (!name.trim()) errs.name = 'Name is required';
     if (!email) errs.email = 'Email is required';
+    // Presence alone let `name@gma` through — no top-level domain, so the
+    // confirmation mail goes nowhere and the account can never be logged into.
+    // type="email" does not catch it; the HTML5 rule allows dotless hosts.
+    else if (!isValidEmail(email)) errs.email = 'Enter a complete email address, like you@gmail.com';
     if (!password) errs.password = 'Password is required';
     if (password.length < 6) errs.password = 'Min 6 characters';
     if (password !== confirmPassword) errs.confirmPassword = 'Passwords don\'t match';

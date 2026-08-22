@@ -72,6 +72,21 @@ export const TRAVEL_TOLERANCE_MIN = 10;
  */
 const isTransport = (a) => a?.category === 'transport';
 
+/**
+ * Arriving late at where you sleep is not a conflict.
+ *
+ * Checking in at 22:00 instead of 21:15 costs nothing: the bed does not close,
+ * nothing is missed, and no one is kept waiting. The checker was reporting it
+ * as an error anyway — a plan that ended with a drive to the homestay was
+ * marked unachievable over a shortfall that has no consequence, and that noise
+ * sits on the last card of the day where it is most visible.
+ *
+ * Only the ARRIVAL is exempt. Leaving an accommodation late still makes you
+ * late for whatever comes next, so this is checked against `a` and never
+ * against `prev`.
+ */
+const isAccommodation = (a) => a?.category === 'accommodation';
+
 export function haversineKm(lat1, lng1, lat2, lng2) {
   const R = 6371;
   const toRad = (d) => (d * Math.PI) / 180;
@@ -254,7 +269,10 @@ export function checkItinerary(trip, days = [], activities = {}, roadLegs = {}) 
       const needed = travelMinutes(km, mode, roadKm, realMinutes);
       const available = start - prevEnd;
 
-      if (km > 0.3 && needed - available > TRAVEL_TOLERANCE_MIN) {
+      // The long-hop warning below still fires for an accommodation: a 120 km
+      // drive to the hotel is worth knowing about even though being late for it
+      // is not. It is only the shortfall that is suppressed.
+      if (km > 0.3 && !isAccommodation(a) && needed - available > TRAVEL_TOLERANCE_MIN) {
         const basis = realMinutes
           ? `${roadKm ? roadKm.toFixed(1) + ' km by road' : 'the route'}, which routing puts at ${fmt(Math.round(realMinutes))} of driving`
           : roadKm
