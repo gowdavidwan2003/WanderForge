@@ -1,25 +1,46 @@
 'use client';
 
 import { useState, useEffect } from 'react';
+import Link from 'next/link';
 import { useRouter } from 'next/navigation';
 import { useAuth } from '@/context/AuthProvider';
 import { useToast } from '@/components/ui/Toast';
 import { getSupabaseBrowserClient } from '@/lib/supabase/client';
 import Button from '@/components/ui/Button';
 import Footer from '@/components/layout/Footer';
-import { ALL_TAGS, TEMPLATE_DATA, templateInterests } from '@/lib/templates';
+import { TEMPLATE_DATA, fetchOfficialTemplates } from '@/lib/templates';
 import { withTimeout } from '@/lib/withTimeout';
-import { inferCurrency } from '@/lib/currency';
 
 export default function ExplorePage() {
   const [filter, setFilter] = useState('all');
   const [search, setSearch] = useState('');
+  // Seeded from the static list so the grid paints immediately and never
+  // flashes empty, then replaced by the live rows. The fallback carries no
+  // plans, so those cards link to the preview rather than claiming a stop count.
+  const [templates, setTemplates] = useState(TEMPLATE_DATA);
+  const [loaded, setLoaded] = useState(false);
+  const [creating, setCreating] = useState(null);
   const router = useRouter();
   const { user } = useAuth();
   const toast = useToast();
   const supabase = getSupabaseBrowserClient();
 
-  const filtered = TEMPLATE_DATA.filter((t) => {
+  useEffect(() => {
+    fetchOfficialTemplates(supabase).then((rows) => {
+      setTemplates(rows);
+      setLoaded(true);
+    });
+  }, []);  // eslint-disable-line react-hooks/exhaustive-deps
+
+  // Only rows that came from the database carry an id, and without one there is
+  // no plan to read and nothing for the RPC to copy. If the fetch has finished
+  // and still nothing has an id, we are on the static fallback — say so, rather
+  // than showing two dead buttons and letting the visitor wonder.
+  const plansUnavailable = loaded && !templates.some((t) => t.id);
+
+  const allTags = [...new Set(templates.flatMap((t) => t.tags))].sort();
+
+  const filtered = templates.filter((t) => {
     const matchesFilter = filter === 'all' || t.tags.includes(filter);
     const matchesSearch = !search || t.destination.toLowerCase().includes(search.toLowerCase());
     return matchesFilter && matchesSearch;
@@ -27,46 +48,28 @@ export default function ExplorePage() {
 
   const handleUseTemplate = async (template) => {
     if (!user) {
-      toast.info('Please sign up to use templates', 'Account Required');
+      // Browsing and reading a plan needs no account. Creating a trip does,
+      // because a trip needs an owner. No return-to parameter: the signup page
+      // does not read one, and a link that claims to come back here when it
+      // will not is worse than an honest one.
+      toast.info('Sign up to save this plan as your own trip', 'Account Required');
       router.push('/auth/signup');
       return;
     }
 
-    // Create a trip from template
+    // Two weeks out — far enough to be plannable, near enough to feel real.
     const startDate = new Date();
-    startDate.setDate(startDate.getDate() + 14); // 2 weeks from now
-    const endDate = new Date(startDate);
-    endDate.setDate(endDate.getDate() + template.duration - 1);
+    startDate.setDate(startDate.getDate() + 14);
 
+    setCreating(template.id);
     try {
-      const days = Array.from({ length: template.duration }, (_, i) => {
-        const d = new Date(startDate);
-        d.setDate(d.getDate() + i);
-        return { day_number: i + 1, date: d.toISOString().split('T')[0] };
-      });
-
-      // One transaction, like the wizard. This was an insert of the trip
-      // followed by an insert of its days, so a failure on the second left a
-      // trip the editor cannot open.
+      // One transaction that writes the trip, its days AND its activities.
+      // create_trip_with_days, which this used to call, writes no activities —
+      // so a template arrived as an empty calendar and the plan was lost.
       const { data: trip, error } = await withTimeout(
-        supabase.rpc('create_trip_with_days', {
-          p_trip: {
-            title: `Trip to ${template.destination}`,
-            destination: template.destination,
-            start_date: startDate.toISOString().split('T')[0],
-            end_date: endDate.toISOString().split('T')[0],
-            status: 'planned',
-            currency: inferCurrency(template.destination) || 'USD',
-            ai_preferences: {
-              // `interests`, not `tags`. The generate route reads
-              // ai_preferences.interests, so writing `tags` here meant every
-              // template produced the same generic trip and the destination's
-              // whole character was thrown away.
-              interests: templateInterests(template),
-              from_template: true,
-            },
-          },
-          p_days: days,
+        supabase.rpc('create_trip_from_template', {
+          p_template_id: template.id,
+          p_start_date: startDate.toISOString().split('T')[0],
         }),
         'Creating your trip'
       );
@@ -75,12 +78,14 @@ export default function ExplorePage() {
       if (!trip?.id) throw new Error('The trip was not created. Please try again.');
 
       toast.success(
-        `${template.duration} days in ${template.destination} are ready to plan.`,
+        `${template.duration} days in ${template.destination}, planned and ready to edit.`,
         'Trip Created 🎉'
       );
       router.push(`/trip/${trip.id}`);
     } catch (err) {
       toast.error(err.message);
+    } finally {
+      setCreating(null);
     }
   };
 
@@ -92,11 +97,11 @@ export default function ExplorePage() {
             <span className="explore__emoji">🗺️</span>
             <h1 className="explore__title">Explore Destinations</h1>
             <p className="explore__subtitle">
-              {/* Not "curated templates": nothing here is a hand-built
-                  itinerary. Each one is a destination, a sensible length and a
-                  few interests, which the AI then plans for you. */}
-              {TEMPLATE_DATA.length}{' '}starting points for the world&apos;s most visited destinations —
-              pick one and the AI plans the days
+              {/* These really are hand-built itineraries now — every day
+                  titled, every stop timed and costed. Read any of them without
+                  an account; you only need one to save a copy you can edit. */}
+              {templates.length}{' '}complete itineraries, written day by day —
+              read one free, then make it yours in a click
             </p>
 
             <div className="explore__search">
@@ -119,7 +124,7 @@ export default function ExplorePage() {
               >
                 All
               </button>
-              {ALL_TAGS.map((tag) => (
+              {allTags.map((tag) => (
                 <button
                   key={tag}
                   className={`filter-btn ${filter === tag ? 'filter-btn--active' : ''}`}
@@ -134,6 +139,13 @@ export default function ExplorePage() {
 
         <div className="explore__grid">
           <div className="container">
+            {plansUnavailable && (
+              <p className="explore__notice">
+                The itineraries could not be loaded, so these are destinations only.
+                Try again in a moment.
+              </p>
+            )}
+
             <div className="templates-grid">
               {filtered.map((t, i) => (
                 <div
@@ -153,9 +165,24 @@ export default function ExplorePage() {
                         <span key={tag} className="template-card__tag">{tag}</span>
                       ))}
                     </div>
-                    <Button variant="primary" size="sm" fullWidth onClick={() => handleUseTemplate(t)}>
-                      Use Template →
-                    </Button>
+                    <div className="template-card__actions">
+                      {/* The preview is a plain link, so it works with no
+                          session and search engines can read the plan. */}
+                      {t.id && (
+                        <Link href={`/explore/${t.id}`} className="template-card__view">
+                          View plan
+                        </Link>
+                      )}
+                      <Button
+                        variant="primary"
+                        size="sm"
+                        fullWidth
+                        disabled={!t.id || creating === t.id}
+                        onClick={() => handleUseTemplate(t)}
+                      >
+                        {creating === t.id ? 'Creating…' : 'Use Template →'}
+                      </Button>
+                    </div>
                   </div>
                 </div>
               ))}
@@ -250,6 +277,17 @@ export default function ExplorePage() {
 
         .explore__grid { padding: var(--space-10) 0; }
 
+        .explore__notice {
+          margin-bottom: var(--space-6);
+          padding: var(--space-3) var(--space-5);
+          border: 1px solid var(--color-border);
+          border-radius: var(--radius-lg);
+          background: var(--color-bg-secondary);
+          color: var(--color-text-secondary);
+          font-size: var(--text-sm);
+          text-align: center;
+        }
+
         .templates-grid {
           display: grid;
           grid-template-columns: repeat(auto-fill, minmax(300px, 1fr));
@@ -322,6 +360,28 @@ export default function ExplorePage() {
           flex-wrap: wrap;
           gap: 6px;
           margin-bottom: var(--space-4);
+        }
+
+        .template-card__actions {
+          display: flex;
+          align-items: center;
+          gap: var(--space-3);
+        }
+
+        .template-card__view {
+          flex-shrink: 0;
+          font-size: var(--text-sm);
+          font-weight: 500;
+          color: var(--color-text-secondary);
+          text-decoration: none;
+          border-bottom: 1px solid var(--color-border);
+          padding-bottom: 1px;
+          transition: all var(--transition-fast);
+        }
+
+        .template-card__view:hover {
+          color: var(--color-primary);
+          border-bottom-color: var(--color-primary);
         }
 
         .template-card__tag {
