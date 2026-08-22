@@ -38,6 +38,11 @@ either achievable or explicitly marked as not.
 you get around — and the AI plans it day by day. Days stream in as they are
 written, usually the first within two seconds, and you can stop it at any point.
 
+**Starting points.** Ten destinations ship with a complete day-by-day itinerary —
+44 days and 206 stops between them, each carrying a time, a category, a cost and
+real coordinates. The whole plan is readable with no account; signing in copies
+it into a trip you own and can edit.
+
 **Checking.** Before anything reaches the database, every consecutive pair of
 activities is measured. Overlaps, activities that end before they start, and
 journeys that do not fit the gap are found and named. Whatever cannot be fixed is
@@ -187,6 +192,7 @@ editor. They are not optional and several are not backward compatible:
 | `012` | RLS performance and index realignment |
 | `013` | Encrypted API-key storage. **Deletes any plaintext keys** — those users must re-enter and rotate |
 | `014` | Shared road-leg cache. Without it every check re-bills Google Routes |
+| `015` | Official templates and their itineraries, plus the function that turns one into a trip. **Without it Explore shows destination-only cards and "Use template" does nothing.** |
 
 `010` also deletes trips that have no days — the orphans left by the old
 two-step creation. Read the block before running it if you have data you care
@@ -272,8 +278,7 @@ base.
   caller.
 - `chart.js`, `@dnd-kit` and `idb` are installed and unused. Budget charts,
   drag-and-drop reordering and offline mode do not exist.
-- `trip_templates`, `reviews` and `activity_photos` are tables nothing reads or
-  writes.
+- `reviews` and `activity_photos` are tables nothing reads or writes.
 - No automated accessibility testing. The manual pass covered focus management,
   keyboard reordering, contrast and reduced motion.
 
