@@ -869,7 +869,15 @@ img {
 }
 
 /* ---- Sections ---- */
-.lp-section { padding: var(--space-12) 0; }
+/* scroll-margin-top keeps the navbar from landing on top of the section title.
+   The navbar is position: fixed, so jumping to #features or #how-it-works puts
+   the section top at viewport top — which is 72px of navbar, directly over the
+   heading. Nothing in the app set this before, so every in-page anchor arrived
+   with its first line covered. */
+.lp-section {
+  padding: var(--space-12) 0;
+  scroll-margin-top: calc(var(--navbar-height) + var(--space-4));
+}
 .lp-section--alt { background: var(--color-bg-secondary); }
 
 .lp-section__title {

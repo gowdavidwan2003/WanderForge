@@ -54,8 +54,14 @@ export default function Navbar() {
               </>
             ) : (
               <>
-                <a href="#features" className="navbar__link">Features</a>
-                <a href="#how-it-works" className="navbar__link">How It Works</a>
+                {/* Rooted at "/" rather than bare "#features". This navbar is
+                    rendered on every page, and these two sections only exist on
+                    the landing page — so from /explore or /legal/terms a bare
+                    fragment pointed at nothing and the link genuinely did
+                    nothing when clicked. Link, not <a>, so arriving from another
+                    page stays a client-side navigation. */}
+                <Link href="/#features" className="navbar__link">Features</Link>
+                <Link href="/#how-it-works" className="navbar__link">How It Works</Link>
                 {/* Was href="#templates" — an anchor no page has ever had, so
                     the link did nothing at all. Explore is the page it meant. */}
                 <Link href="/explore" className="navbar__link">Destinations</Link>
