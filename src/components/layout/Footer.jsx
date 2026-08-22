@@ -72,12 +72,28 @@ export default function Footer() {
                 >
                   Report a Problem
                 </a>
+                <a
+                  href="https://www.linkedin.com/in/gowdavidwan2003/"
+                  target="_blank"
+                  rel="noopener noreferrer"
+                >
+                  Vidwan on LinkedIn
+                </a>
               </div>
             </div>
 
             <div className="footer__bottom">
               <p className="footer__copyright">
-                © {new Date().getFullYear()} WanderForge. Crafted with ❤️ for travelers.
+                © {new Date().getFullYear()} WanderForge. Crafted by{' '}
+                <a
+                  className="footer__author"
+                  href="https://www.linkedin.com/in/gowdavidwan2003/"
+                  target="_blank"
+                  rel="noopener noreferrer"
+                >
+                  Vidwan Gowda
+                </a>
+                .
               </p>
               <div className="footer__badges">
                 <span className="footer__badge">🔒 Secure</span>
@@ -192,6 +208,22 @@ export default function Footer() {
         .footer__copyright {
           font-size: var(--text-sm);
           color: var(--color-text-tertiary);
+        }
+
+        /* Sits outside .footer__links, so it does not inherit those link
+           styles and needs its own. Underlined rather than merely coloured:
+           it is the one link in this row, and nothing around it hints that
+           the name is clickable. */
+        .footer__author {
+          color: var(--color-primary);
+          font-weight: 600;
+          text-decoration: underline;
+          text-underline-offset: 2px;
+          transition: color var(--transition-fast);
+        }
+
+        .footer__author:hover {
+          color: var(--color-primary-dark);
         }
 
         .footer__badges {
