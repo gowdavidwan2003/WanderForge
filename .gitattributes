@@ -1,0 +1,32 @@
+# Git must not rewrite line endings inside binary files.
+#
+# core.autocrlf is true in this clone, so without these rules Git treats an
+# unrecognised file as text and converts LF to CRLF on checkout. For a PDF or an
+# image that is corruption: the bytes change, the file no longer opens, and
+# nothing warns you until somebody clones the repository and tries.
+#
+# Caught when adding IP/WanderForge-Interview-Prep.pdf, which Git reported as
+# "LF will be replaced by CRLF the next time Git touches it".
+*.pdf   binary
+*.png   binary
+*.jpg   binary
+*.jpeg  binary
+*.gif   binary
+*.webp  binary
+*.ico   binary
+*.woff  binary
+*.woff2 binary
+*.ttf   binary
+*.otf   binary
+
+# Text that must keep LF regardless of platform, because these are read by
+# tooling and by Postgres rather than by a Windows editor.
+*.sql   text eol=lf
+*.js    text eol=lf
+*.jsx   text eol=lf
+*.mjs   text eol=lf
+*.json  text eol=lf
+*.md    text eol=lf
+*.yml   text eol=lf
+*.yaml  text eol=lf
+*.css   text eol=lf
