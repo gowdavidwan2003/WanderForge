@@ -80,6 +80,80 @@ describe('the Chikmagaluru day that exposed the bug', () => {
   });
 });
 
+describe('arriving at an accommodation', () => {
+  /**
+   * The reported case, from the editor: dinner in Chikmagaluru town ending at
+   * 21:34, then "Check-in at Coffee Paradise Homestay" starting at 21:34 — no
+   * gap at all for a 19 km drive. The checker called it an error and marked the
+   * day unachievable.
+   *
+   * It isn't one. The bed does not close, nothing is missed, and nobody is kept
+   * waiting. Being 45 minutes later to your own homestay has no consequence.
+   */
+  const dinnerThenCheckIn = (checkInOver = {}) => [
+    act({
+      id: 'dinner', title: 'Dinner at a Local Restaurant', category: 'food',
+      start_time: '20:04', end_time: '21:34', ...TOWN,
+    }),
+    act({
+      id: 'stay', title: 'Check-in at Coffee Paradise Homestay', category: 'accommodation',
+      start_time: '21:34', end_time: '22:00', ...PEAK, ...checkInOver,
+    }),
+  ];
+
+  it('does not demand travel time for the leg into it', () => {
+    expect(types(check(dinnerThenCheckIn()))).not.toContain('travel-time');
+  });
+
+  it('leaves the day with no errors', () => {
+    const result = check(dinnerThenCheckIn());
+    expect(result.summary.errors).toBe(0);
+  });
+
+  it('still demands travel time for the leg OUT of it', () => {
+    // Leaving late still makes you late for something real, so only the arrival
+    // is exempt. Checking out at 09:00 and expecting to be 19 km away by 09:05
+    // is a genuine problem and must still be reported.
+    const leavingLate = [
+      act({
+        id: 'stay', title: 'Check-out from Coffee Paradise Homestay', category: 'accommodation',
+        start_time: '08:00', end_time: '09:00', ...PEAK,
+      }),
+      act({
+        id: 'tour', title: 'Coffee estate tour', category: 'nature',
+        start_time: '09:05', end_time: '11:00', ...TOWN,
+      }),
+    ];
+    expect(types(check(leavingLate))).toContain('travel-time');
+  });
+
+  it('still counts the distance toward the day total', () => {
+    // Suppressing the warning must not make a long drive to the hotel vanish
+    // from the day's mileage — the same guarantee transport entries have.
+    const far = [
+      act({ id: 'a', title: 'Morning', start_time: '09:00', end_time: '10:00', latitude: 13.3161, longitude: 75.7720 }),
+      act({
+        id: 'stay', title: 'Check-in far away', category: 'accommodation',
+        start_time: '10:30', end_time: '11:00', latitude: 12.9716, longitude: 77.5946,
+      }),
+    ];
+    expect(types(check(far))).toContain('long-hop');
+  });
+
+  it('still reports a genuine overlap with an accommodation', () => {
+    // Two things at the same time is a data problem, not a question of whether
+    // lateness matters. That check is untouched.
+    const overlapping = [
+      act({ id: 'dinner', title: 'Dinner', category: 'food', start_time: '20:00', end_time: '22:00', ...TOWN }),
+      act({
+        id: 'stay', title: 'Check-in', category: 'accommodation',
+        start_time: '21:00', end_time: '22:00', ...TOWN,
+      }),
+    ];
+    expect(types(check(overlapping))).toContain('overlap');
+  });
+});
+
 describe('transport entries', () => {
   /** A → transport → B, which is the shape REALISM_RULES asks the model for. */
   const withTransport = (transportOver = {}) => [
@@ -143,12 +217,17 @@ describe('transport entries', () => {
     expect(types(check(clashing))).toContain('overlap');
   });
 
-  it('does not exempt accommodation, which is a place you travel to', () => {
-    const hotel = [
+  it('does not exempt ordinary categories, which are places you travel to', () => {
+    // This guards the transport exemption against quietly widening into "any
+    // category we happen to pass through". It used accommodation as its
+    // example; accommodation is now exempt on its own separate merits —
+    // arriving late at a bed costs nothing, see the block above — so the guard
+    // needs a category where being late still has a consequence.
+    const dinner = [
       act({ id: 'a', title: 'Peak', start_time: '13:00', end_time: '14:00', ...PEAK }),
-      act({ id: 'h', title: 'Check in', category: 'accommodation', start_time: '14:05', end_time: '14:30', ...TOWN }),
+      act({ id: 'f', title: 'Dinner', category: 'food', start_time: '14:05', end_time: '14:30', ...TOWN }),
     ];
-    expect(types(check(hotel))).toContain('travel-time');
+    expect(types(check(dinner))).toContain('travel-time');
   });
 });
 
