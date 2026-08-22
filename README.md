@@ -113,10 +113,18 @@ overshoots by 1.27×, so asking the provider is clearly best and is what happens
 now. The Itinerary Check panel says how many journeys on a trip were measured
 rather than estimated, and offers to measure the rest.
 
-A transport entry is exempt from these checks. It *is* the journey — the prompt
-asks the model to give every hop over 45 minutes its own entry, and measuring the
-gap before that entry and demanding it cover the drive flagged correct plans as
-broken.
+Two categories are exempt from the travel-time check.
+
+A **transport** entry is exempt in both directions. It *is* the journey — the
+prompt asks the model to give every hop over 45 minutes its own entry, and
+measuring the gap before that entry and demanding it cover the drive flagged
+correct plans as broken.
+
+An **accommodation** is exempt on arrival only. Checking in at 22:00 instead of
+21:15 costs nothing: the bed does not close and nothing is missed. Leaving one
+late still makes you late for whatever follows, so departures are still checked.
+Both exemptions suppress only the shortfall — the distance still counts toward
+the day's total, and a long haul to the hotel is still reported as one.
 
 ### What it cannot do
 
